@@ -1,14 +1,20 @@
-import streamlit as st
 import json
-
 from io import BytesIO
-from pypdf import PdfReader
+
+import streamlit as st
 from openai import OpenAI
+from pypdf import PdfReader
 
 
 # =========================================================
-# PAGE CONFIGURATION
+# APPLICATION CONFIGURATION
 # =========================================================
+
+CHAT_MODEL = "gpt-5.4"
+TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
+TTS_MODEL = "gpt-4o-mini-tts"
+TTS_VOICE = "cedar"
+
 
 st.set_page_config(
     page_title="AI Interviewer",
@@ -27,25 +33,12 @@ client = OpenAI(
 
 
 # =========================================================
-# MODEL SETTINGS
-# =========================================================
-
-# You can change these later without changing the rest
-# of the application.
-
-INTERVIEW_MODEL = "gpt-5.4"
-TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
-TTS_MODEL = "gpt-4o-mini-tts"
-TTS_VOICE = "cedar"
-
-
-# =========================================================
 # SESSION STATE
 # =========================================================
 
 def initialise_session_state():
 
-    defaults = {
+    default_values = {
         "skills": [],
         "show_skill_input": False,
         "interview_started": False,
@@ -58,10 +51,12 @@ def initialise_session_state():
         "current_question": None,
         "current_question_audio": None,
         "transcript": [],
-        "question_number": 1
+        "question_number": 1,
+        "interview_result": None,
+        "answer_processing": False
     }
 
-    for key, value in defaults.items():
+    for key, value in default_values.items():
 
         if key not in st.session_state:
             st.session_state[key] = value
@@ -75,24 +70,52 @@ initialise_session_state()
 # =========================================================
 
 def read_pdf(uploaded_file):
-    """
-    Extract text from an uploaded PDF CV.
-    """
 
     reader = PdfReader(
         BytesIO(uploaded_file.getvalue())
     )
 
-    pages = []
+    extracted_pages = []
 
     for page in reader.pages:
 
-        page_text = page.extract_text()
+        page_text = page.extract_text() or ""
 
-        if page_text:
-            pages.append(page_text)
+        if page_text.strip():
+            extracted_pages.append(page_text)
 
-    return "\n".join(pages)
+    cv_text = "\n\n".join(extracted_pages)
+
+    if not cv_text.strip():
+
+        raise ValueError(
+            "No readable text was found in the PDF. "
+            "The CV may be a scanned image rather than a text PDF."
+        )
+
+    return cv_text
+
+
+# =========================================================
+# JSON CLEANING
+# =========================================================
+
+def clean_json_response(response_text):
+
+    cleaned_text = response_text.strip()
+
+    if cleaned_text.startswith("```json"):
+        cleaned_text = cleaned_text[7:]
+
+    elif cleaned_text.startswith("```"):
+        cleaned_text = cleaned_text[3:]
+
+    if cleaned_text.endswith("```"):
+        cleaned_text = cleaned_text[:-3]
+
+    cleaned_text = cleaned_text.strip()
+
+    return json.loads(cleaned_text)
 
 
 # =========================================================
@@ -100,63 +123,39 @@ def read_pdf(uploaded_file):
 # =========================================================
 
 def extract_cv_profile(cv_text, skills):
-    """
-    Ask the model to analyse the candidate's CV and identify
-    evidence relating to the skills that will be interviewed.
-    """
 
-    skills_text = "\n".join(
-        f"- {skill}"
-        for skill in skills
-    )
+    skills_text = ", ".join(skills)
 
     prompt = f"""
-You are analysing a candidate CV before conducting
-a professional job interview.
+You are analysing a candidate CV before a structured job interview.
 
-The candidate is applying for:
+LANGUAGE REQUIREMENT:
 
-JOB TITLE:
-{st.session_state.job_title}
+Return the complete response in English only.
+Do not switch to another language.
 
-JOB DESCRIPTION:
-{st.session_state.job_description}
-
-The interview will specifically cover these skills:
+The interview will focus on the following skills:
 
 {skills_text}
 
-Analyse the candidate CV.
-
 Extract:
 
-1. The candidate's name.
-2. Education.
-3. Employment history.
-4. Relevant projects.
-5. Evidence relating to each interview skill.
+1. The candidate's name
+2. Education
+3. Employment history
+4. Projects
+5. Specific evidence relating to each interview skill
 
-For each skill, identify specific claims in the CV that
-could reasonably be explored during the interview.
+For every interview skill, identify relevant claims, jobs,
+projects, technologies, responsibilities or achievements from
+the CV that could be explored during the interview.
 
-Relevant evidence can include:
+Do not invent information.
 
-- jobs
-- responsibilities
-- projects
-- technologies
-- achievements
-- qualifications
-- technical claims
-- leadership claims
-- tools used
-- outcomes delivered
+If there is no evidence for a skill, return an empty list for
+that skill.
 
-Do not invent experience that does not appear in the CV.
-
-Return ONLY valid JSON.
-
-Use exactly this general structure:
+Return ONLY valid JSON using this structure:
 
 {{
     "candidate_name": "",
@@ -164,13 +163,9 @@ Use exactly this general structure:
     "employment_history": [],
     "projects": [],
     "skill_evidence": {{
-        "Python": [],
-        "SQL": []
+        "skill name": []
     }}
 }}
-
-The skill_evidence keys should correspond to the actual skills
-provided above.
 
 CANDIDATE CV:
 
@@ -178,56 +173,38 @@ CANDIDATE CV:
 """
 
     response = client.responses.create(
-        model=INTERVIEW_MODEL,
+        model=CHAT_MODEL,
         input=prompt
     )
 
-    result = response.output_text.strip()
-
-    # Remove Markdown fences if the model includes them.
-
-    if result.startswith("```json"):
-        result = result[7:]
-
-    elif result.startswith("```"):
-        result = result[3:]
-
-    if result.endswith("```"):
-        result = result[:-3]
-
-    result = result.strip()
-
-    return json.loads(result)
+    return clean_json_response(
+        response.output_text
+    )
 
 
 # =========================================================
-# GET CV EVIDENCE FOR CURRENT SKILL
+# MATCH SKILL EVIDENCE
 # =========================================================
 
 def get_skill_evidence(skill):
-    """
-    Retrieve the CV evidence associated with the current skill.
-    """
 
     if not st.session_state.cv_profile:
         return []
 
-    evidence = (
-        st.session_state.cv_profile
-        .get("skill_evidence", {})
+    skill_evidence = st.session_state.cv_profile.get(
+        "skill_evidence",
+        {}
     )
 
-    # First try exact match.
+    # Try an exact match first
+    if skill in skill_evidence:
+        return skill_evidence[skill]
 
-    if skill in evidence:
-        return evidence[skill]
+    # Try a case-insensitive match
+    for evidence_skill, evidence in skill_evidence.items():
 
-    # Then try case-insensitive matching.
-
-    for key, value in evidence.items():
-
-        if key.lower().strip() == skill.lower().strip():
-            return value
+        if evidence_skill.lower() == skill.lower():
+            return evidence
 
     return []
 
@@ -237,110 +214,95 @@ def get_skill_evidence(skill):
 # =========================================================
 
 def build_interview_context(skill):
-    """
-    Build the system instructions for the interview.
-    """
 
     skill_evidence = get_skill_evidence(skill)
-
-    candidate_name = (
-        st.session_state.cv_profile
-        .get("candidate_name", "Candidate")
-    )
 
     return f"""
 You are conducting a professional structured job interview.
 
-CANDIDATE:
-{candidate_name}
+LANGUAGE RULE:
+
+The entire interview MUST be conducted in English.
+
+Always ask every question in English.
+
+Never switch to another language, even if:
+
+- the CV contains non-English words
+- a transcription contains foreign-language text
+- the candidate uses a foreign-language phrase
+- a previous message contains another language
+- the candidate's answer appears to have been incorrectly transcribed
+
+If a candidate answer appears to have been incorrectly transcribed
+into another language, do not copy that language. Continue the
+interview in English.
+
 
 JOB TITLE:
+
 {st.session_state.job_title}
 
+
 JOB DESCRIPTION:
+
 {st.session_state.job_description}
 
+
 CURRENT INTERVIEW SKILL:
+
 {skill}
 
-RELEVANT EVIDENCE FROM THE CANDIDATE'S CV:
+
+RELEVANT CV EVIDENCE:
+
 {json.dumps(skill_evidence, indent=2)}
 
-Your job is to interview the candidate specifically about:
 
-{skill}
+INTERVIEW INSTRUCTIONS:
 
-Use relevant information from the CV where appropriate.
+Interview the candidate specifically about the current skill.
 
-The purpose of the interview is to understand the candidate's
-genuine experience, knowledge and competence.
+Use CV evidence where it is relevant.
 
-Explore areas such as:
+Explore:
 
-- what the candidate actually did
+- what the candidate personally did
 - the candidate's individual contribution
 - technical choices
-- reasoning behind their approach
+- reasoning behind the approach
 - problems encountered
-- how problems were solved
 - results achieved
 - lessons learned
-- what they would change
-- technical understanding
-- conceptual understanding
-- practical application of the skill
+- what the candidate would change
+- conceptual understanding of the skill
 
-Where the candidate's CV contains relevant experience, use it
-to make questions specific to the candidate.
+Ask exactly ONE question at a time.
 
-Where appropriate, ask follow-up questions based on what the
-candidate has just said.
+Do not combine several questions into one message.
 
-IMPORTANT INTERVIEW RULES:
+Questions should sound like a natural professional interview,
+not a written examination.
 
-1. Ask ONE question at a time.
+Where the candidate gives an interesting or incomplete answer,
+ask a relevant follow-up question.
 
-2. Never ask several questions bundled together.
+Do not tell the candidate whether an answer was good or bad.
 
-3. Keep questions concise and conversational.
+Do not provide feedback, a score or an assessment during the
+interview.
 
-4. Do not provide the candidate with the answer.
+Only return the next interview question.
 
-5. Do not tell the candidate whether an answer was correct,
-   incorrect, strong or weak.
-
-6. Do not score the candidate during the interview.
-
-7. Do not repeatedly ask essentially the same question.
-
-8. Use previous answers to make follow-up questions feel
-   natural.
-
-9. Stay focused on the current skill.
-
-10. Behave like a professional human interviewer rather than
-    a quiz application.
-
-Your response must contain ONLY the next thing the interviewer
-should say to the candidate.
-
-Do not include labels such as "Interviewer:".
-
-Do not explain your reasoning.
-
-Do not include quotation marks around the question.
+The question MUST be written entirely in English.
 """
 
 
 # =========================================================
-# GENERATE QUESTION
+# QUESTION GENERATION
 # =========================================================
 
 def generate_question(skill):
-    """
-    Generate the next interview question using the
-    conversation so far.
-    """
 
     interview_context = build_interview_context(skill)
 
@@ -356,31 +318,36 @@ def generate_question(skill):
     )
 
     response = client.responses.create(
-        model=INTERVIEW_MODEL,
+        model=CHAT_MODEL,
         input=conversation
     )
 
-    return response.output_text.strip()
+    question = response.output_text.strip()
+
+    if not question:
+
+        raise ValueError(
+            "The interviewer did not generate a question."
+        )
+
+    return question
 
 
 # =========================================================
-# TEXT TO SPEECH
+# TEXT-TO-SPEECH
 # =========================================================
 
 def generate_speech(text):
-    """
-    Convert the interviewer's question into speech.
-    """
 
     response = client.audio.speech.create(
         model=TTS_MODEL,
         voice=TTS_VOICE,
         input=text,
         instructions=(
-            "Speak like a friendly, experienced professional "
-            "interviewer. Use a natural conversational pace. "
-            "Sound calm, engaged and human. Avoid sounding "
-            "like you are reading from a script."
+            "Speak entirely in English. "
+            "Speak like a friendly and professional job interviewer. "
+            "Use a calm, natural and conversational delivery. "
+            "Do not sound robotic or as if reading from a script."
         )
     )
 
@@ -388,25 +355,236 @@ def generate_speech(text):
 
 
 # =========================================================
-# TRANSCRIBE CANDIDATE AUDIO
+# AUDIO TRANSCRIPTION
 # =========================================================
 
 def transcribe_audio(audio_file):
-    """
-    Transcribe an answer recorded using the candidate's
-    browser microphone.
-    """
+
+    # Streamlit's UploadedFile-like object may already have a name,
+    # but giving OpenAI an explicit filename helps it identify the format.
+    audio_bytes = audio_file.getvalue()
+
+    transcription_file = BytesIO(audio_bytes)
+    transcription_file.name = "candidate_answer.wav"
 
     transcription = client.audio.transcriptions.create(
         model=TRANSCRIPTION_MODEL,
-        file=(
-            "candidate_answer.wav",
-            audio_file.getvalue(),
-            "audio/wav"
-        )
+        file=transcription_file,
+        language="en"
     )
 
-    return transcription.text.strip()
+    transcript = transcription.text.strip()
+
+    if not transcript:
+
+        raise ValueError(
+            "No speech could be identified in the recording."
+        )
+
+    return transcript
+
+
+# =========================================================
+# FINAL INTERVIEW ASSESSMENT
+# =========================================================
+
+def generate_interview_result():
+
+    if not st.session_state.transcript:
+
+        raise ValueError(
+            "There are no interview answers to assess."
+        )
+
+    transcript_json = json.dumps(
+        st.session_state.transcript,
+        indent=2
+    )
+
+    cv_profile_json = json.dumps(
+        st.session_state.cv_profile,
+        indent=2
+    )
+
+    skills_json = json.dumps(
+        st.session_state.skills,
+        indent=2
+    )
+
+    prompt = f"""
+You are assessing a candidate after a structured job interview.
+
+LANGUAGE REQUIREMENT:
+
+The entire assessment MUST be written in English.
+Never switch to another language.
+
+JOB TITLE:
+
+{st.session_state.job_title}
+
+
+JOB DESCRIPTION:
+
+{st.session_state.job_description}
+
+
+SKILLS ASSESSED:
+
+{skills_json}
+
+
+CANDIDATE CV INFORMATION:
+
+{cv_profile_json}
+
+
+INTERVIEW TRANSCRIPT:
+
+{transcript_json}
+
+
+ASSESSMENT RULES:
+
+The interview answers must be the primary source of evidence.
+
+The CV may provide supporting context, but do not treat a CV claim
+as demonstrated competence unless the candidate's interview answers
+support it.
+
+Do not invent evidence.
+
+Do not assume competence that was not demonstrated.
+
+Do not penalise a candidate merely because the interview did not
+ask about a particular subject.
+
+If there is insufficient evidence for a skill, state that clearly.
+
+For each skill:
+
+1. Assess the candidate's demonstrated knowledge.
+2. Identify specific strengths.
+3. Identify weaknesses, concerns or gaps.
+4. Cite concise evidence from the candidate's actual answers.
+5. Give the skill an integer score from 1 to 5.
+
+Then provide:
+
+- an overall integer score from 1 to 5
+- an overall assessment
+- key strengths
+- key concerns
+- a final recommendation
+
+The recommendation MUST be exactly one of:
+
+"Strongly Recommended"
+"Recommended"
+"Proceed with Caution"
+"Not Recommended"
+
+SCORING GUIDE:
+
+1 = Little or no relevant competence demonstrated
+2 = Limited competence with substantial gaps
+3 = Acceptable competence with some gaps
+4 = Strong competence demonstrated
+5 = Exceptional and detailed competence demonstrated
+
+Return ONLY valid JSON using this exact structure:
+
+{{
+    "overall_score": 0,
+    "recommendation": "",
+    "overall_assessment": "",
+    "key_strengths": [],
+    "key_concerns": [],
+    "skill_assessments": [
+        {{
+            "skill": "",
+            "score": 0,
+            "assessment": "",
+            "strengths": [],
+            "concerns": [],
+            "evidence": []
+        }}
+    ]
+}}
+"""
+
+    response = client.responses.create(
+        model=CHAT_MODEL,
+        input=prompt
+    )
+
+    result = clean_json_response(
+        response.output_text
+    )
+
+    return result
+
+
+# =========================================================
+# CREATE TRANSCRIPT TEXT
+# =========================================================
+
+def create_transcript_text():
+
+    candidate_name = (
+        st.session_state.cv_profile or {}
+    ).get(
+        "candidate_name",
+        "Candidate"
+    )
+
+    lines = [
+        "STRUCTURED AI INTERVIEW TRANSCRIPT",
+        "=" * 60,
+        "",
+        f"Candidate: {candidate_name}",
+        f"Job title: {st.session_state.job_title}",
+        f"Skills: {', '.join(st.session_state.skills)}",
+        "",
+        "=" * 60,
+        ""
+    ]
+
+    for item in st.session_state.transcript:
+
+        lines.extend(
+            [
+                f'SKILL: {item["skill"]}',
+                f'QUESTION {item["question_number"]}',
+                "",
+                "INTERVIEWER:",
+                item["question"],
+                "",
+                "CANDIDATE:",
+                item["answer"],
+                "",
+                "=" * 60,
+                ""
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+# =========================================================
+# RESET THE APPLICATION
+# =========================================================
+
+def reset_interview():
+
+    keys_to_clear = list(
+        st.session_state.keys()
+    )
+
+    for key in keys_to_clear:
+        del st.session_state[key]
+
+    st.rerun()
 
 
 # =========================================================
@@ -418,15 +596,11 @@ def show_setup_screen():
     st.title("🎙️ AI Interviewer")
 
     st.write(
-        "Set up the interview, upload the candidate's CV "
-        "and add the skills you want to explore."
+        "Configure the interview, upload the candidate's CV "
+        "and add the skills you want to assess."
     )
 
     st.divider()
-
-    # -----------------------------------------------------
-    # JOB TITLE
-    # -----------------------------------------------------
 
     job_title = st.text_input(
         "Job Title",
@@ -434,103 +608,76 @@ def show_setup_screen():
         placeholder="e.g. AI Analyst"
     )
 
-    # -----------------------------------------------------
-    # JOB DESCRIPTION
-    # -----------------------------------------------------
-
     job_description = st.text_area(
         "Job Description",
         value=st.session_state.job_description,
-        placeholder=(
-            "Paste the complete job description here..."
-        ),
+        placeholder="Paste the complete job description here...",
         height=250
     )
-
-    # -----------------------------------------------------
-    # CV
-    # -----------------------------------------------------
 
     uploaded_cv = st.file_uploader(
         "Candidate CV",
         type=["pdf"],
-        help="Upload the candidate's CV as a PDF."
+        help="Upload a text-based PDF containing the candidate's CV."
     )
 
     st.divider()
 
-    # =====================================================
-    # SKILLS
-    # =====================================================
-
     st.subheader("Interview Skills")
 
-    st.caption(
-        "Add each skill you want the AI interviewer "
-        "to explore."
-    )
+    if st.session_state.skills:
 
-    # -----------------------------------------------------
-    # DISPLAY EXISTING SKILLS
-    # -----------------------------------------------------
+        for index, skill in enumerate(
+            st.session_state.skills
+        ):
 
-    for index, skill in enumerate(
-        st.session_state.skills
-    ):
-
-        col_skill, col_delete = st.columns(
-            [8, 1]
-        )
-
-        with col_skill:
-
-            st.markdown(
-                f"**{skill}**"
+            skill_column, delete_column = st.columns(
+                [8, 1]
             )
 
-        with col_delete:
+            with skill_column:
 
-            if st.button(
-                "✕",
-                key=f"delete_skill_{index}",
-                help=f"Remove {skill}",
-                use_container_width=True
-            ):
-
-                st.session_state.skills.pop(
-                    index
+                st.markdown(
+                    f"**{skill}**"
                 )
 
-                st.rerun()
+            with delete_column:
 
-    # -----------------------------------------------------
-    # ADD SKILL BUTTON
-    # -----------------------------------------------------
+                if st.button(
+                    "✕",
+                    key=f"delete_skill_{index}",
+                    help=f"Remove {skill}"
+                ):
 
-    col_label, col_button = st.columns(
+                    st.session_state.skills.pop(
+                        index
+                    )
+
+                    st.rerun()
+
+    else:
+
+        st.caption(
+            "No skills have been added yet."
+        )
+
+    label_column, button_column = st.columns(
         [4, 1]
     )
 
-    with col_label:
+    with label_column:
 
-        st.markdown(
-            "### Add Skill"
-        )
+        st.markdown("### Add Skill")
 
-    with col_button:
+    with button_column:
 
         if st.button(
             "➕",
-            key="open_add_skill",
             use_container_width=True,
             help="Add another interview skill"
         ):
 
             st.session_state.show_skill_input = True
-
-    # -----------------------------------------------------
-    # NEW SKILL FORM
-    # -----------------------------------------------------
 
     if st.session_state.show_skill_input:
 
@@ -541,22 +688,20 @@ def show_setup_screen():
 
             new_skill = st.text_input(
                 "Skill",
-                placeholder=(
-                    "e.g. Python, SQL, Machine Learning..."
-                )
+                placeholder="e.g. Python"
             )
 
-            submitted = st.form_submit_button(
+            add_skill_submitted = st.form_submit_button(
                 "Add Skill",
                 type="primary",
                 use_container_width=True
             )
 
-            if submitted:
+            if add_skill_submitted:
 
-                new_skill = new_skill.strip()
+                cleaned_skill = new_skill.strip()
 
-                if not new_skill:
+                if not cleaned_skill:
 
                     st.warning(
                         "Please enter a skill."
@@ -565,46 +710,36 @@ def show_setup_screen():
                 else:
 
                     existing_skills = [
-                        skill.lower().strip()
-                        for skill
-                        in st.session_state.skills
+                        skill.lower()
+                        for skill in st.session_state.skills
                     ]
 
                     if (
-                        new_skill.lower()
-                        not in existing_skills
+                        cleaned_skill.lower()
+                        in existing_skills
                     ):
 
-                        st.session_state.skills.append(
-                            new_skill
+                        st.warning(
+                            "That skill has already been added."
                         )
 
                     else:
 
-                        st.warning(
-                            "That skill has already "
-                            "been added."
+                        st.session_state.skills.append(
+                            cleaned_skill
                         )
 
-                    st.session_state.show_skill_input = False
+                        st.session_state.show_skill_input = False
 
-                    st.rerun()
+                        st.rerun()
 
     st.divider()
-
-    # =====================================================
-    # START INTERVIEW
-    # =====================================================
 
     if st.button(
         "Start Interview",
         type="primary",
         use_container_width=True
     ):
-
-        # ---------------------------------------------
-        # VALIDATION
-        # ---------------------------------------------
 
         if not job_title.strip():
 
@@ -638,10 +773,6 @@ def show_setup_screen():
 
             return
 
-        # ---------------------------------------------
-        # SAVE SETUP
-        # ---------------------------------------------
-
         st.session_state.job_title = (
             job_title.strip()
         )
@@ -650,14 +781,10 @@ def show_setup_screen():
             job_description.strip()
         )
 
-        # ---------------------------------------------
-        # READ CV
-        # ---------------------------------------------
-
         try:
 
-            st.session_state.cv_text = (
-                read_pdf(uploaded_cv)
+            st.session_state.cv_text = read_pdf(
+                uploaded_cv
             )
 
         except Exception as error:
@@ -668,22 +795,8 @@ def show_setup_screen():
 
             return
 
-        if not st.session_state.cv_text.strip():
-
-            st.error(
-                "I could not extract any text from "
-                "this PDF. The CV may be an image-only "
-                "or scanned PDF."
-            )
-
-            return
-
-        # ---------------------------------------------
-        # ANALYSE CV
-        # ---------------------------------------------
-
         with st.spinner(
-            "Analysing candidate CV..."
+            "Analysing the candidate's CV..."
         ):
 
             try:
@@ -698,8 +811,8 @@ def show_setup_screen():
             except json.JSONDecodeError:
 
                 st.error(
-                    "The CV analysis returned an invalid "
-                    "response. Please try again."
+                    "The CV analysis was returned in an unexpected "
+                    "format. Please try again."
                 )
 
                 return
@@ -712,89 +825,17 @@ def show_setup_screen():
 
                 return
 
-        # ---------------------------------------------
-        # INITIALISE INTERVIEW
-        # ---------------------------------------------
-
         st.session_state.interview_started = True
-
         st.session_state.current_skill_index = 0
-
         st.session_state.messages = []
-
         st.session_state.transcript = []
-
         st.session_state.question_number = 1
-
         st.session_state.current_question = None
-
         st.session_state.current_question_audio = None
+        st.session_state.interview_result = None
+        st.session_state.answer_processing = False
 
         st.rerun()
-
-
-# =========================================================
-# INTERVIEW PROGRESS
-# =========================================================
-
-def show_interview_progress():
-
-    completed = (
-        st.session_state.current_skill_index
-    )
-
-    total = len(
-        st.session_state.skills
-    )
-
-    if total > 0:
-
-        progress = completed / total
-
-        st.progress(progress)
-
-        st.caption(
-            f"Interview area "
-            f"{completed + 1} of {total}"
-        )
-
-
-# =========================================================
-# INTERVIEW HISTORY
-# =========================================================
-
-def show_current_skill_history(current_skill):
-    """
-    Show previous questions and answers from the
-    current skill.
-    """
-
-    current_history = [
-        item
-        for item in st.session_state.transcript
-        if item["skill"] == current_skill
-    ]
-
-    if not current_history:
-        return
-
-    with st.expander(
-        "Previous questions and answers"
-    ):
-
-        for item in current_history:
-
-            st.markdown(
-                f"**Interviewer:** "
-                f"{item['question']}"
-            )
-
-            st.markdown(
-                f"**Candidate:** "
-                f"{item['answer']}"
-            )
-
-            st.divider()
 
 
 # =========================================================
@@ -803,133 +844,92 @@ def show_current_skill_history(current_skill):
 
 def show_interview_screen():
 
-    # -----------------------------------------------------
-    # CHECK WHETHER INTERVIEW IS COMPLETE
-    # -----------------------------------------------------
-
     if (
         st.session_state.current_skill_index
         >= len(st.session_state.skills)
     ):
 
         show_finished_screen()
-
         return
 
-    # -----------------------------------------------------
-    # CURRENT SKILL
-    # -----------------------------------------------------
-
-    current_skill = (
-        st.session_state.skills[
-            st.session_state.current_skill_index
-        ]
-    )
+    current_skill = st.session_state.skills[
+        st.session_state.current_skill_index
+    ]
 
     candidate_name = (
-        st.session_state.cv_profile
-        .get(
-            "candidate_name",
-            "Candidate"
-        )
+        st.session_state.cv_profile or {}
+    ).get(
+        "candidate_name",
+        "Candidate"
     )
-
-    # -----------------------------------------------------
-    # HEADER
-    # -----------------------------------------------------
 
     st.title("🎙️ AI Interview")
 
     st.caption(
-        f"Candidate: {candidate_name}"
+        f"Candidate: {candidate_name} | "
+        f"Position: {st.session_state.job_title}"
     )
 
-    st.caption(
-        f"Position: "
-        f"{st.session_state.job_title}"
+    st.progress(
+        (
+            st.session_state.current_skill_index + 1
+        )
+        / len(st.session_state.skills)
     )
 
     st.divider()
 
-    show_interview_progress()
-
     st.subheader(current_skill)
 
-    show_current_skill_history(
-        current_skill
+    st.caption(
+        f"Interview skill "
+        f"{st.session_state.current_skill_index + 1} "
+        f"of {len(st.session_state.skills)}"
     )
 
-    # =====================================================
-    # GENERATE QUESTION
-    # =====================================================
-
+    # Generate the current question only once.
     if st.session_state.current_question is None:
 
         with st.spinner(
-            "Preparing the next question..."
+            "Preparing the next interview question..."
         ):
 
             try:
 
-                question = generate_question(
-                    current_skill
+                st.session_state.current_question = (
+                    generate_question(
+                        current_skill
+                    )
                 )
 
-                st.session_state.current_question = (
-                    question
+                st.session_state.current_question_audio = (
+                    generate_speech(
+                        st.session_state.current_question
+                    )
                 )
 
             except Exception as error:
 
                 st.error(
-                    f"Could not generate the "
-                    f"question: {error}"
+                    f"Could not generate the question: {error}"
                 )
+
+                if st.button(
+                    "Try Again",
+                    use_container_width=True
+                ):
+
+                    st.session_state.current_question = None
+                    st.session_state.current_question_audio = None
+                    st.rerun()
 
                 return
 
-    question = (
-        st.session_state.current_question
-    )
-
-    # =====================================================
-    # QUESTION DISPLAY
-    # =====================================================
+    question = st.session_state.current_question
 
     st.markdown("### Interviewer")
 
-    st.write(question)
-
-    # =====================================================
-    # GENERATE SPEECH ONLY ONCE
-    # =====================================================
-
-    if (
-        st.session_state.current_question_audio
-        is None
-    ):
-
-        with st.spinner(
-            "Preparing interviewer audio..."
-        ):
-
-            try:
-
-                st.session_state.current_question_audio = (
-                    generate_speech(question)
-                )
-
-            except Exception as error:
-
-                st.warning(
-                    "The question was generated, but "
-                    "the interviewer audio could not "
-                    f"be created: {error}"
-                )
-
-    # -----------------------------------------------------
-    # PLAY QUESTION
-    # -----------------------------------------------------
+    st.info(question)
 
     if st.session_state.current_question_audio:
 
@@ -941,45 +941,29 @@ def show_interview_screen():
 
     st.divider()
 
-    # =====================================================
-    # CANDIDATE ANSWER
-    # =====================================================
-
-    st.markdown("### Your Answer")
-
-    st.write(
-        "Record your answer below. You can listen "
-        "back to your recording before submitting it."
-    )
+    st.markdown("### Candidate")
 
     audio = st.audio_input(
         "Record your answer",
         sample_rate=16000,
-        key=(
-            f"answer_"
-            f"{st.session_state.question_number}"
-        )
+        key=f"answer_{st.session_state.question_number}"
     )
 
-    # =====================================================
-    # SUBMIT ANSWER
-    # =====================================================
-
     if audio is not None:
+
+        st.caption(
+            "Your recording is ready. Select Submit Answer "
+            "when you are satisfied with it."
+        )
 
         if st.button(
             "Submit Answer",
             type="primary",
             use_container_width=True,
-            key=(
-                f"submit_answer_"
-                f"{st.session_state.question_number}"
-            )
+            disabled=st.session_state.answer_processing
         ):
 
-            # -----------------------------------------
-            # TRANSCRIPTION
-            # -----------------------------------------
+            st.session_state.answer_processing = True
 
             with st.spinner(
                 "Transcribing your answer..."
@@ -993,24 +977,13 @@ def show_interview_screen():
 
                 except Exception as error:
 
+                    st.session_state.answer_processing = False
+
                     st.error(
                         f"Transcription failed: {error}"
                     )
 
                     return
-
-            if not answer:
-
-                st.warning(
-                    "No speech could be detected. "
-                    "Please record your answer again."
-                )
-
-                return
-
-            # -----------------------------------------
-            # SAVE TRANSCRIPT
-            # -----------------------------------------
 
             st.session_state.transcript.append(
                 {
@@ -1021,10 +994,6 @@ def show_interview_screen():
                     "answer": answer
                 }
             )
-
-            # -----------------------------------------
-            # SAVE AI CONVERSATION
-            # -----------------------------------------
 
             st.session_state.messages.append(
                 {
@@ -1040,103 +1009,90 @@ def show_interview_screen():
                 }
             )
 
-            # -----------------------------------------
-            # PREPARE NEXT QUESTION
-            # -----------------------------------------
-
             st.session_state.question_number += 1
-
             st.session_state.current_question = None
-
             st.session_state.current_question_audio = None
+            st.session_state.answer_processing = False
 
             st.rerun()
 
+    # Show previous answers for the current skill.
+    current_skill_answers = [
+        item
+        for item in st.session_state.transcript
+        if item["skill"] == current_skill
+    ]
+
+    if current_skill_answers:
+
+        with st.expander(
+            f"View recorded answers for {current_skill}"
+        ):
+
+            for item in current_skill_answers:
+
+                st.markdown(
+                    f"**Question {item['question_number']}**"
+                )
+
+                st.write(
+                    item["question"]
+                )
+
+                st.markdown(
+                    "**Candidate answer**"
+                )
+
+                st.write(
+                    item["answer"]
+                )
+
+                st.divider()
+
     st.divider()
 
-    # =====================================================
-    # MOVE TO NEXT SKILL
-    # =====================================================
-
-    if (
+    is_last_skill = (
         st.session_state.current_skill_index
-        < len(st.session_state.skills) - 1
-    ):
+        == len(st.session_state.skills) - 1
+    )
 
-        button_text = (
-            f"Finish {current_skill} "
-            f"and move to next skill"
+    if is_last_skill:
+
+        finish_button_text = (
+            "Finish Interview and Generate Result"
         )
 
     else:
 
-        button_text = (
-            f"Finish {current_skill} "
-            f"and complete interview"
+        next_skill = st.session_state.skills[
+            st.session_state.current_skill_index + 1
+        ]
+
+        finish_button_text = (
+            f"Finish {current_skill} and Move to {next_skill}"
         )
 
     if st.button(
-        button_text,
+        finish_button_text,
         use_container_width=True
     ):
 
+        if not current_skill_answers:
+
+            st.warning(
+                "Please record at least one answer for this skill "
+                "before moving on."
+            )
+
+            return
+
         st.session_state.current_skill_index += 1
-
-        # Reset skill-specific conversation.
         st.session_state.messages = []
-
         st.session_state.current_question = None
-
         st.session_state.current_question_audio = None
+        st.session_state.answer_processing = False
 
         st.rerun()
-
-
-# =========================================================
-# BUILD READABLE TRANSCRIPT
-# =========================================================
-
-def build_transcript_text():
-
-    candidate_name = (
-        st.session_state.cv_profile
-        .get(
-            "candidate_name",
-            "Candidate"
-        )
-    )
-
-    transcript_text = f"""
-AI INTERVIEW TRANSCRIPT
-============================================================
-
-Candidate: {candidate_name}
-Job Title: {st.session_state.job_title}
-
-Interview Skills:
-{", ".join(st.session_state.skills)}
-
-============================================================
-
-"""
-
-    for item in st.session_state.transcript:
-
-        transcript_text += f"""
-SKILL: {item["skill"]}
-QUESTION {item["question_number"]}
-
-INTERVIEWER:
-{item["question"]}
-
-CANDIDATE:
-{item["answer"]}
-
-============================================================
-
-"""
-
-    return transcript_text.strip()
 
 
 # =========================================================
@@ -1147,52 +1103,266 @@ def show_finished_screen():
 
     st.title("✅ Interview Complete")
 
-    candidate_name = (
-        st.session_state.cv_profile
-        .get(
-            "candidate_name",
-            "Candidate"
-        )
-    )
-
     st.success(
-        f"The interview with {candidate_name} "
-        f"has been completed."
-    )
-
-    st.divider()
-
-    # =====================================================
-    # TRANSCRIPT
-    # =====================================================
-
-    st.subheader(
-        "Interview Transcript"
+        "The interview has been completed."
     )
 
     if not st.session_state.transcript:
 
-        st.info(
-            "No interview answers were recorded."
+        st.error(
+            "No interview answers were recorded, so an assessment "
+            "cannot be generated."
         )
 
-    else:
+        if st.button(
+            "Start New Interview",
+            use_container_width=True
+        ):
 
-        previous_skill = None
+            reset_interview()
+
+        return
+
+    # Generate the result only once.
+    if st.session_state.interview_result is None:
+
+        with st.spinner(
+            "Analysing interview performance and generating the result..."
+        ):
+
+            try:
+
+                st.session_state.interview_result = (
+                    generate_interview_result()
+                )
+
+            except json.JSONDecodeError:
+
+                st.error(
+                    "The assessment was returned in an unexpected "
+                    "format. Select Retry Assessment."
+                )
+
+                if st.button(
+                    "Retry Assessment",
+                    use_container_width=True
+                ):
+
+                    st.session_state.interview_result = None
+                    st.rerun()
+
+                return
+
+            except Exception as error:
+
+                st.error(
+                    f"Could not generate the interview result: {error}"
+                )
+
+                if st.button(
+                    "Retry Assessment",
+                    use_container_width=True
+                ):
+
+                    st.session_state.interview_result = None
+                    st.rerun()
+
+                return
+
+    result = st.session_state.interview_result
+
+    st.header("Interview Result")
+
+    recommendation = result.get(
+        "recommendation",
+        "Assessment unavailable"
+    )
+
+    overall_score = result.get(
+        "overall_score",
+        0
+    )
+
+    st.subheader(recommendation)
+
+    st.metric(
+        "Overall Score",
+        f"{overall_score} / 5"
+    )
+
+    st.markdown("### Overall Assessment")
+
+    st.write(
+        result.get(
+            "overall_assessment",
+            "No overall assessment was returned."
+        )
+    )
+
+    strength_column, concern_column = st.columns(
+        2
+    )
+
+    with strength_column:
+
+        st.markdown("### Key Strengths")
+
+        key_strengths = result.get(
+            "key_strengths",
+            []
+        )
+
+        if key_strengths:
+
+            for strength in key_strengths:
+                st.markdown(
+                    f"- {strength}"
+                )
+
+        else:
+
+            st.write(
+                "No clear strengths were identified."
+            )
+
+    with concern_column:
+
+        st.markdown("### Key Concerns")
+
+        key_concerns = result.get(
+            "key_concerns",
+            []
+        )
+
+        if key_concerns:
+
+            for concern in key_concerns:
+                st.markdown(
+                    f"- {concern}"
+                )
+
+        else:
+
+            st.write(
+                "No significant concerns were identified."
+            )
+
+    st.divider()
+
+    st.header("Skill Assessments")
+
+    skill_assessments = result.get(
+        "skill_assessments",
+        []
+    )
+
+    if not skill_assessments:
+
+        st.warning(
+            "The assessment did not contain individual skill results."
+        )
+
+    for skill_result in skill_assessments:
+
+        skill_name = skill_result.get(
+            "skill",
+            "Skill"
+        )
+
+        skill_score = skill_result.get(
+            "score",
+            0
+        )
+
+        with st.container(
+            border=True
+        ):
+
+            st.subheader(
+                f"{skill_name}: {skill_score}/5"
+            )
+
+            st.write(
+                skill_result.get(
+                    "assessment",
+                    "No skill assessment was returned."
+                )
+            )
+
+            st.markdown("**Strengths**")
+
+            skill_strengths = skill_result.get(
+                "strengths",
+                []
+            )
+
+            if skill_strengths:
+
+                for strength in skill_strengths:
+                    st.markdown(
+                        f"- {strength}"
+                    )
+
+            else:
+
+                st.write(
+                    "No clear strengths were demonstrated."
+                )
+
+            st.markdown("**Concerns or gaps**")
+
+            skill_concerns = skill_result.get(
+                "concerns",
+                []
+            )
+
+            if skill_concerns:
+
+                for concern in skill_concerns:
+                    st.markdown(
+                        f"- {concern}"
+                    )
+
+            else:
+
+                st.write(
+                    "No significant concerns were identified."
+                )
+
+            st.markdown("**Interview evidence**")
+
+            evidence_items = skill_result.get(
+                "evidence",
+                []
+            )
+
+            if evidence_items:
+
+                for evidence in evidence_items:
+                    st.markdown(
+                        f"- {evidence}"
+                    )
+
+            else:
+
+                st.write(
+                    "No specific interview evidence was returned."
+                )
+
+    # Create the text transcript before the expander.
+    transcript_text = create_transcript_text()
+
+    st.divider()
+
+    with st.expander(
+        "View Full Interview Transcript"
+    ):
 
         for item in st.session_state.transcript:
 
-            if item["skill"] != previous_skill:
-
-                st.markdown(
-                    f"## {item['skill']}"
-                )
-
-                previous_skill = item["skill"]
-
             st.markdown(
-                f"### Question "
-                f"{item['question_number']}"
+                f"### {item['skill']}: "
+                f"Question {item['question_number']}"
             )
 
             st.markdown(
@@ -1213,67 +1383,58 @@ def show_finished_screen():
 
             st.divider()
 
-    # =====================================================
-    # DOWNLOADS
-    # =====================================================
-
-    transcript_text = (
-        build_transcript_text()
-    )
+    st.header("Downloads")
 
     st.download_button(
         "📄 Download Transcript",
         data=transcript_text,
-        file_name=(
-            "interview_transcript.txt"
-        ),
+        file_name="interview_transcript.txt",
         mime="text/plain",
         use_container_width=True
     )
 
-    structured_data = {
-        "candidate": candidate_name,
+    complete_result = {
         "job_title":
             st.session_state.job_title,
+
         "job_description":
             st.session_state.job_description,
+
         "skills":
             st.session_state.skills,
-        "cv_profile":
+
+        "candidate":
             st.session_state.cv_profile,
-        "interview":
+
+        "assessment":
+            st.session_state.interview_result,
+
+        "transcript":
             st.session_state.transcript
     }
 
-    json_data = json.dumps(
-        structured_data,
-        indent=2
+    complete_result_json = json.dumps(
+        complete_result,
+        indent=2,
+        ensure_ascii=False
     )
 
     st.download_button(
-        "📊 Download Structured JSON",
-        data=json_data,
-        file_name=(
-            "interview_results.json"
-        ),
+        "📊 Download Complete Results",
+        data=complete_result_json,
+        file_name="interview_results.json",
         mime="application/json",
         use_container_width=True
     )
 
     st.divider()
 
-    # =====================================================
-    # NEW INTERVIEW
-    # =====================================================
-
     if st.button(
         "Start New Interview",
         use_container_width=True
     ):
 
-        st.session_state.clear()
-
-        st.rerun()
+        reset_interview()
 
 
 # =========================================================
