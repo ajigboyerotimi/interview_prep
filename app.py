@@ -943,78 +943,94 @@ def show_interview_screen():
 
     st.markdown("### Candidate")
 
-    audio = st.audio_input(
-        "Record your answer",
-        sample_rate=16000,
-        key=f"answer_{st.session_state.question_number}"
+audio = st.audio_input(
+    "🎙️ Record your answer",
+    sample_rate=16000,
+    key=f"answer_{st.session_state.question_number}"
+)
+
+if audio is not None:
+
+    # -----------------------------------------
+    # RECORDING CONFIRMATION
+    # -----------------------------------------
+
+    audio_bytes = audio.getvalue()
+
+    st.success(
+        f"Recording captured successfully "
+        f"({len(audio_bytes):,} bytes)"
     )
 
-    if audio is not None:
+    st.write(
+        "Listen to your recording before submitting it:"
+    )
 
-        st.caption(
-            "Your recording is ready. Select Submit Answer "
-            "when you are satisfied with it."
-        )
+    st.audio(
+        audio_bytes,
+        format="audio/wav"
+    )
 
-        if st.button(
-            "Submit Answer",
-            type="primary",
-            use_container_width=True,
-            disabled=st.session_state.answer_processing
+    # -----------------------------------------
+    # SUBMIT
+    # -----------------------------------------
+
+    if st.button(
+        "Submit Answer",
+        type="primary",
+        use_container_width=True
+    ):
+
+        with st.spinner(
+            "Transcribing your answer..."
         ):
 
-            st.session_state.answer_processing = True
+            try:
 
-            with st.spinner(
-                "Transcribing your answer..."
-            ):
+                answer = transcribe_audio(
+                    audio
+                )
 
-                try:
+            except Exception as error:
 
-                    answer = transcribe_audio(
-                        audio
-                    )
+                st.error(
+                    f"Transcription failed: {error}"
+                )
 
-                except Exception as error:
+                return
 
-                    st.session_state.answer_processing = False
+        # -----------------------------------------
+        # SHOW TRANSCRIPTION
+        # -----------------------------------------
 
-                    st.error(
-                        f"Transcription failed: {error}"
-                    )
+        st.session_state.transcript.append(
+            {
+                "skill": current_skill,
+                "question_number":
+                    st.session_state.question_number,
+                "question": question,
+                "answer": answer
+            }
+        )
 
-                    return
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": question
+            }
+        )
 
-            st.session_state.transcript.append(
-                {
-                    "skill": current_skill,
-                    "question_number":
-                        st.session_state.question_number,
-                    "question": question,
-                    "answer": answer
-                }
-            )
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": answer
+            }
+        )
 
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": question
-                }
-            )
+        st.session_state.question_number += 1
+        st.session_state.current_question = None
 
-            st.session_state.messages.append(
-                {
-                    "role": "user",
-                    "content": answer
-                }
-            )
-
-            st.session_state.question_number += 1
-            st.session_state.current_question = None
-            st.session_state.current_question_audio = None
-            st.session_state.answer_processing = False
-
-            st.rerun()
+        st.rerun()
 
     # Show previous answers for the current skill.
     current_skill_answers = [
