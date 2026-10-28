@@ -294,7 +294,7 @@ interview.
 
 Only return the next interview question.
 
-The question MUST be written entirely in English.
+The question MUST be written entirely in English. Include punctation marks and indications of prosody.
 """
 
 
