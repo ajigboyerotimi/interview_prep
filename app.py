@@ -370,15 +370,7 @@ def transcribe_audio(audio_file):
     transcription = client.audio.transcriptions.create(
         model=TRANSCRIPTION_MODEL,
         file=transcription_file,
-        language="en",
-        prompt=(
-            "This is a professional job interview conducted entirely "
-            "in English. Transcribe the candidate's spoken English "
-            "accurately. Do not translate the speech. Do not convert "
-            "English speech into Spanish or any other language. "
-            "Technical terms, programming languages, product names "
-            "and company names should be preserved accurately."
-        )
+        language="en"
     )
 
     transcript = transcription.text.strip()
