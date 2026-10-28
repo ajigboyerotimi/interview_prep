@@ -945,7 +945,7 @@ def show_interview_screen():
 
     audio = st.audio_input(
         "Record your answer",
-        sample_rate=16000,
+        sample_rate=None,
         key=f"answer_{st.session_state.question_number}"
     )
 
