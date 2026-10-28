@@ -1,3 +1,4 @@
 streamlit
 openai
 pypdf
+audio-recorder-streamlit-auto==0.0.1
