@@ -360,20 +360,20 @@ def generate_speech(text):
 
 def transcribe_audio(audio_file):
 
-    # Streamlit's UploadedFile-like object may already have a name,
-    # but giving OpenAI an explicit filename helps it identify the format.
-    audio_bytes = audio_file.getvalue()
-
-    transcription_file = BytesIO(audio_bytes)
-    transcription_file.name = "candidate_answer.wav"
+    audio_file.name = "candidate_answer.wav"
 
     transcription = client.audio.transcriptions.create(
-        model=TRANSCRIPTION_MODEL,
-        file=transcription_file,
-        language="en"
+        model="gpt-4o-transcribe",
+        file=audio_file,
+        language="en",
+        prompt=(
+            "This is a professional job interview conducted entirely "
+            "in English. Transcribe the candidate's spoken English "
+            "accurately. Do not translate the speech into another language."
+        )
     )
 
-    transcript = transcription.text.strip()
+    return transcription.text.strip()
 
     if not transcript:
 
