@@ -12,8 +12,8 @@ from pypdf import PdfReader
 
 CHAT_MODEL = "gpt-5.4"
 TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
-TTS_MODEL = "gpt-4o-mini-tts"
-TTS_VOICE = "cedar"
+TTS_MODEL = "gpt-4o-mini-tts-2025-12-15"
+TTS_VOICE = "marin"
 
 
 st.set_page_config(
