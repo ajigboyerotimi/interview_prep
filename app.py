@@ -302,8 +302,8 @@ def advance_after_answer():
 def show_setup_screen():
     st.title("🎙️ AI Interviewer")
     st.write(
-        "Upload the candidate's CV, enter the job information, and add the skills "
-        "to assess. The interview asks three questions per skill."
+        "Upload the candidate's CV, enter the job description, and add the skills "
+        "to assess"
     )
     st.divider()
 
