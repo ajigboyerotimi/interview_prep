@@ -360,20 +360,28 @@ def generate_speech(text):
 
 def transcribe_audio(audio_file):
 
-    audio_file.name = "candidate_answer.wav"
+    # Streamlit's UploadedFile-like object may already have a name,
+    # but giving OpenAI an explicit filename helps it identify the format.
+    audio_bytes = audio_file.getvalue()
+
+    transcription_file = BytesIO(audio_bytes)
+    transcription_file.name = "candidate_answer.wav"
 
     transcription = client.audio.transcriptions.create(
-        model="gpt-4o-transcribe",
-        file=audio_file,
+        model=TRANSCRIPTION_MODEL,
+        file=transcription_file,
         language="en",
         prompt=(
             "This is a professional job interview conducted entirely "
             "in English. Transcribe the candidate's spoken English "
-            "accurately. Do not translate the speech into another language."
+            "accurately. Do not translate the speech. Do not convert "
+            "English speech into Spanish or any other language. "
+            "Technical terms, programming languages, product names "
+            "and company names should be preserved accurately."
         )
     )
 
-    return transcription.text.strip()
+    transcript = transcription.text.strip()
 
     if not transcript:
 
@@ -943,94 +951,78 @@ def show_interview_screen():
 
     st.markdown("### Candidate")
 
-audio = st.audio_input(
-    "🎙️ Record your answer",
-    sample_rate=16000,
-    key=f"answer_{st.session_state.question_number}"
-)
-
-if audio is not None:
-
-    # -----------------------------------------
-    # RECORDING CONFIRMATION
-    # -----------------------------------------
-
-    audio_bytes = audio.getvalue()
-
-    st.success(
-        f"Recording captured successfully "
-        f"({len(audio_bytes):,} bytes)"
+    audio = st.audio_input(
+        "Record your answer",
+        sample_rate=16000,
+        key=f"answer_{st.session_state.question_number}"
     )
 
-    st.write(
-        "Listen to your recording before submitting it:"
-    )
+    if audio is not None:
 
-    st.audio(
-        audio_bytes,
-        format="audio/wav"
-    )
+        st.caption(
+            "Your recording is ready. Select Submit Answer "
+            "when you are satisfied with it."
+        )
 
-    # -----------------------------------------
-    # SUBMIT
-    # -----------------------------------------
-
-    if st.button(
-        "Submit Answer",
-        type="primary",
-        use_container_width=True
-    ):
-
-        with st.spinner(
-            "Transcribing your answer..."
+        if st.button(
+            "Submit Answer",
+            type="primary",
+            use_container_width=True,
+            disabled=st.session_state.answer_processing
         ):
 
-            try:
+            st.session_state.answer_processing = True
 
-                answer = transcribe_audio(
-                    audio
-                )
+            with st.spinner(
+                "Transcribing your answer..."
+            ):
 
-            except Exception as error:
+                try:
 
-                st.error(
-                    f"Transcription failed: {error}"
-                )
+                    answer = transcribe_audio(
+                        audio
+                    )
 
-                return
+                except Exception as error:
 
-        # -----------------------------------------
-        # SHOW TRANSCRIPTION
-        # -----------------------------------------
+                    st.session_state.answer_processing = False
 
-        st.session_state.transcript.append(
-            {
-                "skill": current_skill,
-                "question_number":
-                    st.session_state.question_number,
-                "question": question,
-                "answer": answer
-            }
-        )
+                    st.error(
+                        f"Transcription failed: {error}"
+                    )
 
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": question
-            }
-        )
+                    return
 
-        st.session_state.messages.append(
-            {
-                "role": "user",
-                "content": answer
-            }
-        )
+            st.session_state.transcript.append(
+                {
+                    "skill": current_skill,
+                    "question_number":
+                        st.session_state.question_number,
+                    "question": question,
+                    "answer": answer
+                }
+            )
 
-        st.session_state.question_number += 1
-        st.session_state.current_question = None
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": question
+                }
+            )
 
-        st.rerun()
+            st.session_state.messages.append(
+                {
+                    "role": "user",
+                    "content": answer
+                }
+            )
+
+            st.session_state.question_number += 1
+            st.session_state.current_question = None
+            st.session_state.current_question_audio = None
+            st.session_state.answer_processing = False
+
+            st.rerun()
 
     # Show previous answers for the current skill.
     current_skill_answers = [
