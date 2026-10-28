@@ -623,7 +623,7 @@ def show_setup_screen():
 
     st.divider()
 
-    st.subheader("Interview Skills")
+    st.subheader("Required Skills")
 
     if st.session_state.skills:
 
