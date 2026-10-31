@@ -23,20 +23,24 @@ MAX_QUESTIONS_PER_SKILL = 4      # hard cap on questions for each skill
 PREP_COUNTDOWN_SECONDS = 30      # pause between question audio and recording
 MAX_ANSWER_SECONDS = 180         # maximum recording length (3 minutes)
 
-# Importance slider (1-10) labels
+# Importance slider (1-5) labels and definitions
 IMPORTANCE_LABELS = {
-    1: "Minimal",
-    2: "Low",
-    3: "Minor",
-    4: "Useful",
-    5: "Moderate",
-    6: "Important",
-    7: "Very important",
-    8: "High priority",
-    9: "Essential",
-    10: "Critical",
+    1: "Nice to have",
+    2: "Useful",
+    3: "Important",
+    4: "Very important",
+    5: "Essential",
 }
-DEFAULT_IMPORTANCE = 5
+IMPORTANCE_MEANINGS = {
+    1: "a bonus, but the role works fine without it",
+    2: "helpful day to day, can be learned on the job",
+    3: "expected at a competent level",
+    4: "core to success in the role",
+    5: "the role can't be done without it",
+}
+IMPORTANCE_MIN = 1
+IMPORTANCE_MAX = 5
+DEFAULT_IMPORTANCE = 3
 
 # Overall score (0-100) -> recommendation. Checked from the top down.
 RECOMMENDATION_THRESHOLDS = [
@@ -622,7 +626,7 @@ def generate_interview_result():
         [
             {
                 "skill": skill["name"],
-                "importance_out_of_10": skill["importance"]
+                "importance_out_of_5": skill["importance"]
             }
             for skill in st.session_state.skills
         ],
@@ -678,6 +682,22 @@ Do not penalise a candidate merely because the interview did not
 ask about a particular subject.
 
 If there is insufficient evidence for a skill, state that clearly.
+
+ZERO-SCORE RULE:
+
+Some transcripts are not genuine answers. They may be nonsensical,
+irrelevant to the question, unintelligible, extremely short, written
+in a language other than English, or unrelated sentences that look like
+transcription errors (for example from silence or background noise).
+Such text demonstrates no competence.
+
+If ALL of the candidate's answers for a skill are of this kind, the
+score for that skill MUST be exactly 0. Do not award any points on the
+basis of the CV, the job description or the wording of the questions.
+State clearly in the assessment that no relevant answer was given.
+
+If only SOME answers for a skill are of this kind, ignore those answers
+and score the skill using only the genuine answers.
 
 Score each skill independently on its own merits. The importance
 values are applied to the overall score separately, so do NOT
@@ -874,7 +894,7 @@ def show_setup_screen():
 
                 st.markdown(
                     f"**{skill['name']}** &nbsp;·&nbsp; "
-                    f"importance {skill['importance']}/10 "
+                    f"importance {skill['importance']}/{IMPORTANCE_MAX} "
                     f"({IMPORTANCE_LABELS[skill['importance']]}) "
                     f"&nbsp;·&nbsp; {shares[index]}% of overall score"
                 )
@@ -931,15 +951,22 @@ def show_setup_screen():
 
             new_importance = st.select_slider(
                 "Importance of this skill for the role",
-                options=list(range(1, 11)),
+                options=list(
+                    range(IMPORTANCE_MIN, IMPORTANCE_MAX + 1)
+                ),
                 value=DEFAULT_IMPORTANCE,
                 format_func=format_importance
             )
 
             st.caption(
-                "**Calibration:** 1-2 Nice to have · 3-4 Useful · "
-                "5-6 Important · 7-8 Very important · "
-                "9-10 Critical / essential to the role"
+                "**Calibration:** "
+                + " · ".join(
+                    f"**{value} {IMPORTANCE_LABELS[value]}** "
+                    f"({IMPORTANCE_MEANINGS[value]})"
+                    for value in range(
+                        IMPORTANCE_MIN, IMPORTANCE_MAX + 1
+                    )
+                )
             )
 
             add_skill_submitted = st.form_submit_button(
@@ -1537,7 +1564,9 @@ def show_finished_screen():
             [
                 {
                     "Skill": item["skill"],
-                    "Importance": f"{item['importance']}/10",
+                    "Importance": (
+                        f"{item['importance']}/{IMPORTANCE_MAX}"
+                    ),
                     "Weight": f"{item['weight_percent']}%",
                     "Score": f"{item['score']}%"
                 }
@@ -1572,7 +1601,8 @@ def show_finished_screen():
             )
 
             st.caption(
-                f"Importance {skill_result.get('importance', '-')}/10 "
+                f"Importance {skill_result.get('importance', '-')}"
+                f"/{IMPORTANCE_MAX} "
                 f"· {skill_result.get('weight_percent', '-')}% "
                 f"of the overall score"
             )
