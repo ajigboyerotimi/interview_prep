@@ -2,6 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   html, body { margin: 0; padding: 0; background: transparent; }
   body { font-family: "Source Sans Pro", -apple-system, "Segoe UI", sans-serif; color: #31333F; }
@@ -11,18 +12,22 @@
   #track { height: 8px; border-radius: 4px; background: rgba(128,128,128,.25); overflow: hidden; margin-bottom: 14px; }
   #fill { height: 100%; width: 0%; background: #ff4b4b; transition: width .25s linear; }
   #fill.countdown { background: #f0a500; }
-  button { font-family: inherit; font-size: 15px; font-weight: 600; color: #fff; background: #ff4b4b;
-           border: 0; border-radius: 8px; padding: 10px 20px; cursor: pointer; width: 100%; }
+  /* Pulsing recording indicator: its halo follows the live microphone level. */
+  #orbWrap { height: 96px; display: flex; align-items: center; justify-content: center; }
+  #orb { width: 40px; height: 40px; border-radius: 50%; background: #ff4b4b;
+         box-shadow: 0 0 0 6px rgba(255,75,75,.28);
+         transition: box-shadow .08s linear, transform .08s linear; }
+  button { font-family: inherit; font-size: 16px; font-weight: 600; color: #fff; background: #ff4b4b;
+           border: 0; border-radius: 8px; padding: 12px 20px; cursor: pointer; width: 100%;
+           -webkit-tap-highlight-color: transparent; }
   button:hover { filter: brightness(1.08); }
-  .hidden { display: none; }
+  .hidden { display: none !important; }
   #msg { font-size: 13px; margin-top: 10px; color: #d33; }
-  .pulse { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #ff4b4b;
-           margin-right: 6px; animation: pulse 1s infinite; }
-  @keyframes pulse { 0% { opacity: 1; } 50% { opacity: .25; } 100% { opacity: 1; } }
 </style>
 </head>
 <body>
 <div id="card">
+  <div id="orbWrap" class="hidden"><div id="orb"></div></div>
   <div id="status"></div>
   <div id="time"></div>
   <div id="track"><div id="fill"></div></div>
@@ -31,6 +36,7 @@
 </div>
 
 <script>
+(function () {
   // ---- Minimal Streamlit component protocol (no build step needed) ----
   const Streamlit = {
     send(type, data) {
@@ -42,13 +48,22 @@
   };
 
   const $ = (id) => document.getElementById(id);
-  const statusEl = $("status"), timeEl = $("time"), fillEl = $("fill"), actionEl = $("action"), msgEl = $("msg");
+  const statusEl = $("status"), timeEl = $("time"), fillEl = $("fill"), actionEl = $("action"),
+        msgEl = $("msg"), orbWrap = $("orbWrap"), orb = $("orb");
+
+  const TARGET_RATE = 16000;   // answers are sent as 16 kHz mono WAV on every device
 
   function fmt(sec) {
     sec = Math.max(0, Math.ceil(sec));
     return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
   }
-  function resize() { Streamlit.height(document.documentElement.scrollHeight + 4); }
+
+  // Measure the card itself (not the document), otherwise the frame keeps growing.
+  let lastHeight = 0;
+  function resize() {
+    const h = Math.ceil($("card").getBoundingClientRect().height) + 4;
+    if (h !== lastHeight) { lastHeight = h; Streamlit.height(h); }
+  }
 
   function applyTheme(theme) {
     if (!theme) return;
@@ -59,154 +74,277 @@
     }
   }
 
-  let started = false;
+  // ---- Shared state (kept across questions if the frame is reused) ----
+  const player = new Audio();             // one element, reused: once a tap unlocks it, later questions autoplay
+  player.setAttribute("playsinline", "");
+  player.preload = "auto";
 
+  let ctx = null, stream = null, micPromise = null;
+  let source = null, processor = null, chunks = [], capturing = false;
+  let ticker = null, level = 0, smooth = 0, recStart = 0, actionHandler = null;
+  let currentNonce = null, flowId = 0, COUNTDOWN = 30, MAX_RECORD = 180;
+
+  function setAction(label, handler) {
+    if (!label) { actionEl.classList.add("hidden"); actionHandler = null; resize(); return; }
+    actionEl.textContent = label;
+    actionEl.classList.remove("hidden");
+    actionHandler = handler;
+    resize();
+  }
+  actionEl.addEventListener("click", () => { if (actionHandler) actionHandler(); });
+
+  function show(status, time, pct, isCountdown) {
+    statusEl.innerHTML = status;
+    timeEl.textContent = time;
+    fillEl.style.width = pct + "%";
+    fillEl.classList.toggle("countdown", !!isCountdown);
+    resize();
+  }
+  function showOrb() { orbWrap.classList.remove("hidden"); resize(); }
+  function hideOrb() { orbWrap.classList.add("hidden"); resize(); }
+
+  // ---- Audio helpers ----
+  function ensureCtx() {
+    if (!ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      ctx = new AC();
+    }
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    return ctx;
+  }
+
+  function getMic() {
+    if (stream && stream.getTracks().some((t) => t.readyState === "live")) return Promise.resolve(stream);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return Promise.reject(new Error("Microphone access is not available in this browser or context."));
+    }
+    return navigator.mediaDevices.getUserMedia({ audio: true }).then((s) => { stream = s; return s; });
+  }
+
+  function micError(err) {
+    clearInterval(ticker);
+    hideOrb();
+    show("Microphone problem", "⚠️", 0, false);
+    msgEl.textContent = (err && err.message ? err.message : "Could not access the microphone.") +
+                        " Allow microphone access in your browser, then press Retry.";
+    setAction("Retry microphone", () => {
+      msgEl.textContent = "";
+      micPromise = getMic();
+      micPromise.then(() => startRecording(flowId)).catch(micError);
+    });
+  }
+
+  function releaseMic() {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+  }
+
+  function stopCapture() {
+    capturing = false;
+    try { if (processor) { processor.onaudioprocess = null; processor.disconnect(); } } catch (e) {}
+    try { if (source) source.disconnect(); } catch (e) {}
+    processor = null; source = null;
+  }
+
+  // ---- Flow control: one "flow" per question ----
+  function cleanupFlow() {
+    clearInterval(ticker);
+    stopCapture();
+    releaseMic();
+    chunks = [];
+    player.onended = null; player.onerror = null;
+    try { player.pause(); } catch (e) {}
+    hideOrb();
+    msgEl.textContent = "";
+  }
+
+  function startFlow(args) {
+    cleanupFlow();
+    const id = ++flowId;
+    COUNTDOWN = args.countdown_seconds || 30;
+    MAX_RECORD = args.max_record_seconds || 180;
+    playQuestion(args.question_audio, id);
+  }
+
+  // Phase 1: the interviewer speaks
+  function playQuestion(b64, id) {
+    if (!b64) { startCountdown(id); return; }
+    player.onended = () => startCountdown(id);
+    player.onerror = () => startCountdown(id);
+    player.src = "data:audio/mpeg;base64," + b64;
+    show("🔊 The interviewer is asking the question…", "", 0, false);
+    setAction(null);
+    const p = player.play();
+    if (p && p.catch) {
+      p.catch(() => {
+        if (id !== flowId) return;
+        // Phones (especially iPhones) only allow sound after a tap.
+        show("📱 Your phone needs a tap before it can play sound.", "🔇", 0, false);
+        setAction("▶ Tap to hear the question", () => {
+          ensureCtx();   // unlock audio for recording too
+          show("🔊 The interviewer is asking the question…", "", 0, false);
+          setAction(null);
+          player.play().catch(() => startCountdown(id));
+        });
+      });
+    }
+  }
+
+  // Phase 2: preparation countdown
+  function startCountdown(id) {
+    if (id !== flowId) return;
+    clearInterval(ticker);
+    micPromise = getMic();               // ask for the mic now (after the question has finished playing)
+    micPromise.catch(() => {});
+    const begin = Date.now();
+    const tick = () => {
+      const remaining = COUNTDOWN - (Date.now() - begin) / 1000;
+      if (remaining <= 0) { clearInterval(ticker); startRecording(id); return; }
+      show("Get ready — recording starts automatically in", fmt(remaining),
+           ((COUNTDOWN - remaining) / COUNTDOWN) * 100, true);
+    };
+    tick();
+    ticker = setInterval(tick, 250);
+    setAction("Start recording now", () => { clearInterval(ticker); startRecording(id); });
+  }
+
+  // Phase 3: recording (raw audio -> 16 kHz WAV, identical on every browser)
+  function startRecording(id) {
+    if (id !== flowId) return;
+    clearInterval(ticker);
+    setAction(null);
+    msgEl.textContent = "";
+    ensureCtx();
+    (micPromise || getMic()).then((s) => {
+      if (id !== flowId) return;
+      // resume() can stall on phones without a fresh tap, so don't wait forever
+      const resumed = Promise.race([
+        ctx.resume().catch(() => {}),
+        new Promise((r) => setTimeout(r, 600))
+      ]);
+      return resumed.then(() => {
+        if (id !== flowId) return;
+        if (ctx.state !== "running") {
+          show("Tap to start recording", "🎤", 0, false);
+          setAction("🎤 Tap to start recording", () => { ensureCtx(); startRecording(id); });
+          return;
+        }
+        beginCapture(s, id);
+      });
+    }).catch(micError);
+  }
+
+  function beginCapture(s, id) {
+    chunks = []; level = 0; smooth = 0;
+    source = ctx.createMediaStreamSource(s);
+    processor = ctx.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (e) => {
+      if (!capturing) return;
+      const input = e.inputBuffer.getChannelData(0);
+      chunks.push(new Float32Array(input));
+      let sum = 0;
+      for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+      level = Math.sqrt(sum / input.length);
+    };
+    source.connect(processor);
+    processor.connect(ctx.destination);   // needed for processing to run; output is silent
+    capturing = true;
+    recStart = Date.now();
+    showOrb();
+
+    const tick = () => {
+      const elapsed = (Date.now() - recStart) / 1000;
+      // The orb's halo and size follow the live microphone level.
+      smooth = smooth * 0.55 + level * 0.45;
+      const halo = 6 + Math.min(34, smooth * 320);
+      orb.style.boxShadow = "0 0 0 " + halo.toFixed(1) + "px rgba(255,75,75,.28)";
+      orb.style.transform = "scale(" + (1 + Math.min(0.5, smooth * 5)).toFixed(2) + ")";
+      show("🔴 Recording your answer", fmt(elapsed) + " / " + fmt(MAX_RECORD), (elapsed / MAX_RECORD) * 100, false);
+      if (elapsed >= MAX_RECORD) stopRecording(id);
+    };
+    tick();
+    ticker = setInterval(tick, 60);
+    setAction("⏹ Done — submit my answer", () => stopRecording(id));
+  }
+
+  function stopRecording(id) {
+    if (!capturing) return;
+    clearInterval(ticker);
+    stopCapture();
+    releaseMic();
+    hideOrb();
+    setAction(null);
+
+    const duration = (Date.now() - recStart) / 1000;
+    if (duration < 0.5 || chunks.length === 0) {
+      msgEl.textContent = "That recording was too short. Please try again.";
+      show("Ready when you are", "", 0, false);
+      micPromise = getMic(); micPromise.catch(() => {});
+      setAction("🎤 Record again", () => startRecording(id));
+      return;
+    }
+
+    const wav = encodeWav(chunks, ctx.sampleRate);
+    chunks = [];
+    show("✅ Answer captured — processing…", "", 100, false);
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const b64 = String(reader.result).split(",")[1] || "";
+      Streamlit.value({ audio: b64, mime: "audio/wav", duration: duration, nonce: currentNonce });
+    };
+    reader.readAsDataURL(wav);
+  }
+
+  // Float32 chunks -> 16 kHz mono 16-bit WAV blob
+  function encodeWav(parts, inRate) {
+    let total = 0;
+    parts.forEach((c) => { total += c.length; });
+    const merged = new Float32Array(total);
+    let off = 0;
+    parts.forEach((c) => { merged.set(c, off); off += c.length; });
+
+    const ratio = inRate / TARGET_RATE;
+    const outLen = Math.max(1, Math.floor(total / ratio));
+    const pcm = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const start = Math.floor(i * ratio);
+      const end = Math.min(total, Math.max(start + 1, Math.floor((i + 1) * ratio)));
+      let sum = 0, n = 0;
+      for (let j = start; j < end; j++) { sum += merged[j]; n++; }
+      let v = n ? sum / n : 0;
+      v = Math.max(-1, Math.min(1, v));
+      pcm[i] = v < 0 ? v * 0x8000 : v * 0x7FFF;
+    }
+
+    const dataLen = pcm.length * 2;
+    const header = new ArrayBuffer(44);
+    const dv = new DataView(header);
+    const writeStr = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+    writeStr(0, "RIFF"); dv.setUint32(4, 36 + dataLen, true); writeStr(8, "WAVE");
+    writeStr(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, TARGET_RATE, true); dv.setUint32(28, TARGET_RATE * 2, true);
+    dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    writeStr(36, "data"); dv.setUint32(40, dataLen, true);
+    return new Blob([header, pcm.buffer], { type: "audio/wav" });
+  }
+
+  window.addEventListener("pagehide", releaseMic);
+
+  // ---- Streamlit render events: start a new flow whenever the question changes ----
   window.addEventListener("message", (event) => {
     if (!event.data || event.data.type !== "streamlit:render") return;
     applyTheme(event.data.theme);
-    // Streamlit re-sends render events on every rerun; only start once.
-    if (started) return;
-    started = true;
-    run(event.data.args || {});
+    const args = event.data.args || {};
+    // Streamlit re-sends render events on every rerun; only react to a new question.
+    if (args.nonce === currentNonce) return;
+    currentNonce = args.nonce;
+    startFlow(args);
   });
 
   Streamlit.ready();
   resize();
-
-  function run(args) {
-    const COUNTDOWN = args.countdown_seconds || 30;
-    const MAX_RECORD = args.max_record_seconds || 180;
-
-    let stream = null, micPromise = null, recorder = null, chosenMime = "";
-    let chunks = [], ticker = null, recStart = 0, actionHandler = null;
-
-    function setAction(label, handler) {
-      if (!label) { actionEl.classList.add("hidden"); actionHandler = null; return; }
-      actionEl.textContent = label;
-      actionEl.classList.remove("hidden");
-      actionHandler = handler;
-    }
-    actionEl.addEventListener("click", () => { if (actionHandler) actionHandler(); });
-
-    function show(status, time, pct, isCountdown) {
-      statusEl.innerHTML = status;
-      timeEl.textContent = time;
-      fillEl.style.width = pct + "%";
-      fillEl.classList.toggle("countdown", !!isCountdown);
-      resize();
-    }
-
-    // ---- Microphone ----
-    function getMic() {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        return Promise.reject(new Error("Microphone access is not available in this browser or context."));
-      }
-      return navigator.mediaDevices.getUserMedia({ audio: true }).then((s) => { stream = s; return s; });
-    }
-    function micError(err) {
-      clearInterval(ticker);
-      show("Microphone problem", "⚠️", 0, false);
-      msgEl.textContent = (err && err.message ? err.message : "Could not access the microphone.") +
-                          " Allow microphone access in your browser, then press Retry.";
-      setAction("Retry microphone", () => {
-        msgEl.textContent = "";
-        micPromise = getMic();
-        micPromise.then(startCountdown).catch(micError);
-      });
-    }
-
-    // ---- Phase 1: interviewer audio ----
-    function playQuestion() {
-      if (!args.question_audio) { startCountdown(); return; }
-      const audio = new Audio("data:audio/mpeg;base64," + args.question_audio);
-      audio.onended = startCountdown;
-      audio.onerror = startCountdown;
-      show("🔊 The interviewer is asking the question…", "", 0, false);
-      setAction(null);
-      const p = audio.play();
-      if (p && p.catch) {
-        p.catch(() => {
-          // Browser blocked autoplay: let the user start it manually.
-          show("Your browser blocked automatic playback.", "🔇", 0, false);
-          setAction("▶ Play question", () => {
-            show("🔊 The interviewer is asking the question…", "", 0, false);
-            setAction(null);
-            audio.play().catch(startCountdown);
-          });
-        });
-      }
-    }
-
-    // ---- Phase 2: preparation countdown ----
-    function startCountdown() {
-      clearInterval(ticker);
-      const begin = Date.now();
-      const tick = () => {
-        const remaining = COUNTDOWN - (Date.now() - begin) / 1000;
-        if (remaining <= 0) { clearInterval(ticker); startRecording(); return; }
-        show("Get ready — recording starts automatically in", fmt(remaining),
-             ((COUNTDOWN - remaining) / COUNTDOWN) * 100, true);
-      };
-      tick();
-      ticker = setInterval(tick, 250);
-      setAction("Start recording now", () => { clearInterval(ticker); startRecording(); });
-    }
-
-    // ---- Phase 3: recording ----
-    function startRecording() {
-      setAction(null);
-      (micPromise || getMic()).then(() => {
-        const types = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
-        chosenMime = types.find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
-        recorder = chosenMime ? new MediaRecorder(stream, { mimeType: chosenMime }) : new MediaRecorder(stream);
-        chunks = [];
-        recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
-        recorder.onstop = finish;
-        recorder.start(1000);
-        recStart = Date.now();
-
-        const tick = () => {
-          const elapsed = (Date.now() - recStart) / 1000;
-          show('<span class="pulse"></span>Recording your answer',
-               fmt(elapsed) + " / " + fmt(MAX_RECORD), (elapsed / MAX_RECORD) * 100, false);
-          if (elapsed >= MAX_RECORD) stopRecording();
-        };
-        tick();
-        ticker = setInterval(tick, 250);
-        setAction("⏹ Done — submit my answer", stopRecording);
-      }).catch(micError);
-    }
-
-    function stopRecording() {
-      clearInterval(ticker);
-      setAction(null);
-      if (recorder && recorder.state !== "inactive") recorder.stop();
-    }
-
-    function finish() {
-      if (stream) stream.getTracks().forEach((t) => t.stop());
-      const type = (recorder && recorder.mimeType) || chosenMime || "audio/webm";
-      const blob = new Blob(chunks, { type: type });
-      const duration = (Date.now() - recStart) / 1000;
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const b64 = String(reader.result).split(",")[1] || "";
-        show("✅ Answer captured — processing…", "", 100, false);
-        Streamlit.value({ audio: b64, mime: type, duration: duration });
-      };
-      reader.readAsDataURL(blob);
-    }
-
-    window.addEventListener("pagehide", () => {
-      if (stream) stream.getTracks().forEach((t) => t.stop());
-    });
-
-    // Ask for the microphone straight away so the permission prompt
-    // appears while the question is playing, not when recording begins.
-    micPromise = getMic();
-    micPromise.catch(() => {});   // errors are handled when recording starts
-    playQuestion();
-  }
+})();
 </script>
 </body>
 </html>
