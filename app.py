@@ -19,7 +19,14 @@ TTS_MODEL = "gpt-4o-mini-tts-2025-12-15"
 TTS_VOICE = "marin"
 
 # Interview flow
-MAX_QUESTIONS_PER_SKILL = 4      # hard cap on questions for each skill
+# Questions asked per skill, decided by the skill's importance (1-5)
+QUESTIONS_BY_IMPORTANCE = {
+    1: 2,
+    2: 3,
+    3: 5,
+    4: 6,
+    5: 7,
+}
 PREP_COUNTDOWN_SECONDS = 30      # pause between question audio and recording
 MAX_ANSWER_SECONDS = 180         # maximum recording length (3 minutes)
 
@@ -42,13 +49,59 @@ IMPORTANCE_MIN = 1
 IMPORTANCE_MAX = 5
 DEFAULT_IMPORTANCE = 3
 
-# Overall score (0-100) -> recommendation. Checked from the top down.
-RECOMMENDATION_THRESHOLDS = [
-    (80, "Strongly Recommended"),
-    (65, "Recommended"),
-    (50, "Proceed with Caution"),
-    (0, "Not Recommended"),
+# Score (0-100) -> competency level. Checked from the top down.
+# These match the bands in the scoring guide given to the model.
+LEVEL_THRESHOLDS = [
+    (81, "Expert"),
+    (61, "Advanced"),
+    (41, "Intermediate"),
+    (21, "Beginner"),
+    (0, "Unqualified"),
 ]
+LEVEL_COLOURS = {
+    "Unqualified": "#dc2626",
+    "Beginner": "#ea580c",
+    "Intermediate": "#d97706",
+    "Advanced": "#65a30d",
+    "Expert": "#15803d",
+}
+
+# Makes the importance slider thicker and easier to see.
+SLIDER_CSS = """
+<style>
+div[data-testid="stSlider"] [data-baseweb="slider"] > div:first-child,
+div[data-testid="stSlider"] [data-baseweb="slider"] > div:first-child > div {
+    height: 14px !important;
+    border-radius: 7px !important;
+}
+div[data-testid="stSlider"] [role="slider"] {
+    height: 30px !important;
+    width: 30px !important;
+    box-shadow: 0 0 0 3px rgba(255, 75, 75, 0.35) !important;
+}
+div[data-testid="stSlider"] {
+    padding-top: 0.5rem;
+}
+.imp-markers {
+    position: relative;
+    height: 2.8rem;
+    margin: 0 0 0.5rem 0;
+    font-size: 0.8rem;
+    line-height: 1.2;
+    opacity: 0.75;
+}
+.imp-marker {
+    position: absolute;
+    top: 0;
+    text-align: center;
+    transform: translateX(-50%);
+    white-space: nowrap;
+}
+.imp-marker.first { transform: none; text-align: left; }
+.imp-marker.last { transform: translateX(-100%); text-align: right; }
+.imp-marker.active { font-weight: 700; opacity: 1; color: #ff4b4b; }
+</style>
+"""
 
 
 st.set_page_config(
@@ -88,6 +141,7 @@ def initialise_session_state():
     default_values = {
         "skills": [],              # list of {"name": str, "importance": int}
         "show_skill_input": False,
+        "skill_form_message": "",
         "interview_started": False,
         "cv_text": "",
         "cv_profile": None,
@@ -120,6 +174,21 @@ initialise_session_state()
 def skill_names():
 
     return [skill["name"] for skill in st.session_state.skills]
+
+
+def max_questions_for(skill_name):
+    """Number of questions to ask for a skill, based on its importance."""
+
+    for skill in st.session_state.skills:
+
+        if skill["name"] == skill_name:
+
+            return QUESTIONS_BY_IMPORTANCE.get(
+                skill["importance"],
+                QUESTIONS_BY_IMPORTANCE[DEFAULT_IMPORTANCE]
+            )
+
+    return QUESTIONS_BY_IMPORTANCE[DEFAULT_IMPORTANCE]
 
 
 def importance_shares():
@@ -295,11 +364,13 @@ def build_interview_context(skill, question_in_skill):
 
     skill_evidence = get_skill_evidence(skill)
 
-    if question_in_skill >= MAX_QUESTIONS_PER_SKILL:
+    max_questions = max_questions_for(skill)
+
+    if question_in_skill >= max_questions:
 
         progress_instruction = (
             f"This is question {question_in_skill} of "
-            f"{MAX_QUESTIONS_PER_SKILL} for this skill, and it is the "
+            f"{max_questions} for this skill, and it is the "
             "LAST one. Ask the single most valuable remaining question "
             "for judging the candidate's competence in this skill. "
             "Do not mention that it is the final question."
@@ -309,7 +380,7 @@ def build_interview_context(skill, question_in_skill):
 
         progress_instruction = (
             f"This is question {question_in_skill} of "
-            f"{MAX_QUESTIONS_PER_SKILL} for this skill. You have a "
+            f"{max_questions} for this skill. You have a "
             "limited number of questions, so cover the most important "
             "ground and avoid repeating topics already discussed."
         )
@@ -526,14 +597,30 @@ def clamp_score(value):
     return max(0, min(100, score))
 
 
-def recommendation_for_score(score):
+def level_for_score(score):
 
-    for threshold, label in RECOMMENDATION_THRESHOLDS:
+    for threshold, label in LEVEL_THRESHOLDS:
 
         if score >= threshold:
             return label
 
-    return RECOMMENDATION_THRESHOLDS[-1][1]
+    return LEVEL_THRESHOLDS[-1][1]
+
+
+def level_badge(level, large=False):
+    """Return an HTML pill badge for a competency level."""
+
+    colour = LEVEL_COLOURS.get(level, "#6b7280")
+
+    padding = "0.4rem 1.2rem" if large else "0.15rem 0.7rem"
+    font_size = "1.2rem" if large else "0.8rem"
+
+    return (
+        f'<span style="display:inline-block;background:{colour};'
+        f"color:#fff;font-weight:700;border-radius:999px;"
+        f"padding:{padding};font-size:{font_size};"
+        f'letter-spacing:0.03em;">{level}</span>'
+    )
 
 
 def apply_weighted_scoring(result):
@@ -541,7 +628,7 @@ def apply_weighted_scoring(result):
     Attach importance and weight to each skill assessment, then
     compute the overall score (0-100) as an importance-weighted
     average of the skill scores. The overall score and the
-    recommendation are calculated here, not by the model, so the
+    competency level are calculated here, not by the model, so the
     maths is consistent and reproducible.
     """
 
@@ -575,6 +662,7 @@ def apply_weighted_scoring(result):
 
         item["skill"] = skill["name"]
         item["score"] = clamp_score(item.get("score"))
+        item["level"] = level_for_score(item["score"])
         item["importance"] = skill["importance"]
         item["weight_percent"] = round(
             skill["importance"] / total_importance * 100
@@ -593,7 +681,7 @@ def apply_weighted_scoring(result):
 
     result["skill_assessments"] = ordered_assessments
     result["overall_score"] = overall_score
-    result["recommendation"] = recommendation_for_score(
+    result["level"] = level_for_score(
         overall_score
     )
 
@@ -835,6 +923,47 @@ def advance_to_next_skill():
 
 
 # =========================================================
+# ADD SKILL (button callback)
+# =========================================================
+
+def add_skill_callback():
+
+    cleaned_skill = st.session_state.get(
+        "new_skill_name", ""
+    ).strip()
+
+    importance = st.session_state.get(
+        "new_skill_importance", DEFAULT_IMPORTANCE
+    )
+
+    if not cleaned_skill:
+
+        st.session_state.skill_form_message = (
+            "Please enter a skill."
+        )
+        return
+
+    if cleaned_skill.lower() in [
+        name.lower() for name in skill_names()
+    ]:
+
+        st.session_state.skill_form_message = (
+            "That skill has already been added."
+        )
+        return
+
+    st.session_state.skills.append(
+        {
+            "name": cleaned_skill,
+            "importance": importance
+        }
+    )
+
+    st.session_state.skill_form_message = ""
+    st.session_state.show_skill_input = False
+
+
+# =========================================================
 # SETUP SCREEN
 # =========================================================
 
@@ -873,9 +1002,11 @@ def show_setup_screen():
     st.subheader("Interview Skills")
 
     st.caption(
-        f"Each skill gets up to {MAX_QUESTIONS_PER_SKILL} questions. "
-        "Importance decides how much each skill counts towards the "
-        "overall score."
+        "Importance decides how many questions a skill gets "
+        "(" + ", ".join(
+            f"{level}: {count}"
+            for level, count in QUESTIONS_BY_IMPORTANCE.items()
+        ) + ") and how much it counts towards the overall score."
     )
 
     if st.session_state.skills:
@@ -939,80 +1070,57 @@ def show_setup_screen():
 
     if st.session_state.show_skill_input:
 
-        with st.form(
-            "add_skill_form",
-            clear_on_submit=True
-        ):
+        st.markdown(SLIDER_CSS, unsafe_allow_html=True)
 
-            new_skill = st.text_input(
-                "Skill",
-                placeholder="e.g. Python"
+        st.text_input(
+            "Skill",
+            placeholder="e.g. Python",
+            key="new_skill_name"
+        )
+
+        new_importance = st.slider(
+            "Importance of this skill for the role",
+            min_value=IMPORTANCE_MIN,
+            max_value=IMPORTANCE_MAX,
+            value=DEFAULT_IMPORTANCE,
+            step=1,
+            key="new_skill_importance"
+        )
+
+        span = IMPORTANCE_MAX - IMPORTANCE_MIN
+
+        markers = "".join(
+            '<span class="imp-marker'
+            + (" first" if value == IMPORTANCE_MIN else "")
+            + (" last" if value == IMPORTANCE_MAX else "")
+            + (" active" if value == new_importance else "")
+            + f'" style="left:{(value - IMPORTANCE_MIN) / span * 100}%">'
+            + f"{value}<br>{IMPORTANCE_LABELS[value]}</span>"
+            for value in range(IMPORTANCE_MIN, IMPORTANCE_MAX + 1)
+        )
+
+        st.markdown(
+            f'<div class="imp-markers">{markers}</div>',
+            unsafe_allow_html=True
+        )
+
+        st.caption(
+            f"**{new_importance} - {IMPORTANCE_LABELS[new_importance]}:** "
+            f"{IMPORTANCE_MEANINGS[new_importance]}"
+        )
+
+        if st.session_state.skill_form_message:
+
+            st.warning(
+                st.session_state.skill_form_message
             )
 
-            new_importance = st.select_slider(
-                "Importance of this skill for the role",
-                options=list(
-                    range(IMPORTANCE_MIN, IMPORTANCE_MAX + 1)
-                ),
-                value=DEFAULT_IMPORTANCE,
-                format_func=format_importance
-            )
-
-            st.caption(
-                "**Calibration:** "
-                + " · ".join(
-                    f"**{value} {IMPORTANCE_LABELS[value]}** "
-                    f"({IMPORTANCE_MEANINGS[value]})"
-                    for value in range(
-                        IMPORTANCE_MIN, IMPORTANCE_MAX + 1
-                    )
-                )
-            )
-
-            add_skill_submitted = st.form_submit_button(
-                "Add Skill",
-                type="primary",
-                use_container_width=True
-            )
-
-            if add_skill_submitted:
-
-                cleaned_skill = new_skill.strip()
-
-                if not cleaned_skill:
-
-                    st.warning(
-                        "Please enter a skill."
-                    )
-
-                else:
-
-                    existing_skills = [
-                        name.lower()
-                        for name in skill_names()
-                    ]
-
-                    if (
-                        cleaned_skill.lower()
-                        in existing_skills
-                    ):
-
-                        st.warning(
-                            "That skill has already been added."
-                        )
-
-                    else:
-
-                        st.session_state.skills.append(
-                            {
-                                "name": cleaned_skill,
-                                "importance": new_importance
-                            }
-                        )
-
-                        st.session_state.show_skill_input = False
-
-                        st.rerun()
+        st.button(
+            "Add Skill",
+            type="primary",
+            use_container_width=True,
+            on_click=add_skill_callback
+        )
 
     st.divider()
 
@@ -1174,7 +1282,7 @@ def show_interview_screen():
         f"{st.session_state.current_skill_index + 1} "
         f"of {len(st.session_state.skills)} | "
         f"Question {len(current_skill_answers) + 1} "
-        f"of {MAX_QUESTIONS_PER_SKILL}"
+        f"of {max_questions_for(current_skill)}"
     )
 
     # Generate the current question only once.
@@ -1312,7 +1420,10 @@ def show_interview_screen():
         st.session_state.answer_processing = False
 
         # Maximum questions reached: move on automatically.
-        if len(current_skill_answers) + 1 >= MAX_QUESTIONS_PER_SKILL:
+        if (
+            len(current_skill_answers) + 1
+            >= max_questions_for(current_skill)
+        ):
 
             advance_to_next_skill()
 
@@ -1465,9 +1576,9 @@ def show_finished_screen():
 
     st.header("Interview Result")
 
-    recommendation = result.get(
-        "recommendation",
-        "Assessment unavailable"
+    overall_level = result.get(
+        "level",
+        "Unqualified"
     )
 
     overall_score = result.get(
@@ -1475,7 +1586,10 @@ def show_finished_screen():
         0
     )
 
-    st.subheader(recommendation)
+    st.markdown(
+        level_badge(overall_level, large=True),
+        unsafe_allow_html=True
+    )
 
     st.metric(
         "Overall Score (importance-weighted)",
@@ -1568,7 +1682,8 @@ def show_finished_screen():
                         f"{item['importance']}/{IMPORTANCE_MAX}"
                     ),
                     "Weight": f"{item['weight_percent']}%",
-                    "Score": f"{item['score']}%"
+                    "Score": f"{item['score']}%",
+                    "Level": item["level"]
                 }
                 for item in skill_assessments
             ]
@@ -1594,6 +1709,16 @@ def show_finished_screen():
 
             st.subheader(
                 f"{skill_name}: {skill_score}%"
+            )
+
+            st.markdown(
+                level_badge(
+                    skill_result.get(
+                        "level",
+                        level_for_score(skill_score)
+                    )
+                ),
+                unsafe_allow_html=True
             )
 
             st.progress(
