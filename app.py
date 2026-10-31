@@ -1097,7 +1097,7 @@ def show_setup_screen():
         )
 
         st.caption(
-            f"{IMPORTANCE_MEANINGS[new_importance]}"
+            f"**{IMPORTANCE_LABELS[new_importance]}:** {IMPORTANCE_MEANINGS[new_importance]}"
         )
 
         if st.session_state.skill_form_message:
