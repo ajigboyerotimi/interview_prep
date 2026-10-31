@@ -1,7 +1,10 @@
+import base64
 import json
 from io import BytesIO
+from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 from openai import OpenAI
 from pypdf import PdfReader
 
@@ -14,6 +17,34 @@ CHAT_MODEL = "gpt-5.4"
 TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 TTS_MODEL = "gpt-4o-mini-tts-2025-12-15"
 TTS_VOICE = "marin"
+
+# Interview flow
+MAX_QUESTIONS_PER_SKILL = 4      # hard cap on questions for each skill
+PREP_COUNTDOWN_SECONDS = 30      # pause between question audio and recording
+MAX_ANSWER_SECONDS = 180         # maximum recording length (3 minutes)
+
+# Importance slider (1-10) labels
+IMPORTANCE_LABELS = {
+    1: "Minimal",
+    2: "Low",
+    3: "Minor",
+    4: "Useful",
+    5: "Moderate",
+    6: "Important",
+    7: "Very important",
+    8: "High priority",
+    9: "Essential",
+    10: "Critical",
+}
+DEFAULT_IMPORTANCE = 5
+
+# Overall score (0-100) -> recommendation. Checked from the top down.
+RECOMMENDATION_THRESHOLDS = [
+    (80, "Strongly Recommended"),
+    (65, "Recommended"),
+    (50, "Proceed with Caution"),
+    (0, "Not Recommended"),
+]
 
 
 st.set_page_config(
@@ -33,13 +64,25 @@ client = OpenAI(
 
 
 # =========================================================
+# CUSTOM RECORDER COMPONENT
+# =========================================================
+# Plays the question audio, runs the preparation countdown, then
+# records automatically. The front end lives in recorder_component/.
+
+interview_recorder = components.declare_component(
+    "interview_recorder",
+    path=str(Path(__file__).parent / "recorder_component")
+)
+
+
+# =========================================================
 # SESSION STATE
 # =========================================================
 
 def initialise_session_state():
 
     default_values = {
-        "skills": [],
+        "skills": [],              # list of {"name": str, "importance": int}
         "show_skill_input": False,
         "interview_started": False,
         "cv_text": "",
@@ -52,6 +95,7 @@ def initialise_session_state():
         "current_question_audio": None,
         "transcript": [],
         "question_number": 1,
+        "recording_attempt": 0,
         "interview_result": None,
         "answer_processing": False
     }
@@ -63,6 +107,36 @@ def initialise_session_state():
 
 
 initialise_session_state()
+
+
+# =========================================================
+# SKILL HELPERS
+# =========================================================
+
+def skill_names():
+
+    return [skill["name"] for skill in st.session_state.skills]
+
+
+def importance_shares():
+    """Return each skill's share of the overall score, in percent."""
+
+    total = sum(
+        skill["importance"] for skill in st.session_state.skills
+    )
+
+    if total == 0:
+        return [0 for _ in st.session_state.skills]
+
+    return [
+        round(skill["importance"] / total * 100)
+        for skill in st.session_state.skills
+    ]
+
+
+def format_importance(value):
+
+    return f"{value} - {IMPORTANCE_LABELS[value]}"
 
 
 # =========================================================
@@ -213,9 +287,28 @@ def get_skill_evidence(skill):
 # INTERVIEW CONTEXT
 # =========================================================
 
-def build_interview_context(skill):
+def build_interview_context(skill, question_in_skill):
 
     skill_evidence = get_skill_evidence(skill)
+
+    if question_in_skill >= MAX_QUESTIONS_PER_SKILL:
+
+        progress_instruction = (
+            f"This is question {question_in_skill} of "
+            f"{MAX_QUESTIONS_PER_SKILL} for this skill, and it is the "
+            "LAST one. Ask the single most valuable remaining question "
+            "for judging the candidate's competence in this skill. "
+            "Do not mention that it is the final question."
+        )
+
+    else:
+
+        progress_instruction = (
+            f"This is question {question_in_skill} of "
+            f"{MAX_QUESTIONS_PER_SKILL} for this skill. You have a "
+            "limited number of questions, so cover the most important "
+            "ground and avoid repeating topics already discussed."
+        )
 
     return f"""
 You are conducting a professional structured job interview.
@@ -259,6 +352,11 @@ RELEVANT CV EVIDENCE:
 {json.dumps(skill_evidence, indent=2)}
 
 
+QUESTION PROGRESS:
+
+{progress_instruction}
+
+
 INTERVIEW INSTRUCTIONS:
 
 Interview the candidate specifically about the current skill.
@@ -282,7 +380,8 @@ Ask exactly ONE question at a time.
 Do not combine several questions into one message.
 
 Questions should sound like a natural professional interview,
-not a written examination.
+not a written examination. Candidates have about three minutes
+to answer each question, so keep questions answerable in that time.
 
 Where the candidate gives an interesting or incomplete answer,
 ask a relevant follow-up question.
@@ -304,7 +403,17 @@ The question MUST be written entirely in English. Include punctation marks and i
 
 def generate_question(skill):
 
-    interview_context = build_interview_context(skill)
+    question_in_skill = len(
+        [
+            item for item in st.session_state.transcript
+            if item["skill"] == skill
+        ]
+    ) + 1
+
+    interview_context = build_interview_context(
+        skill,
+        question_in_skill
+    )
 
     conversation = [
         {
@@ -358,14 +467,29 @@ def generate_speech(text):
 # AUDIO TRANSCRIPTION
 # =========================================================
 
-def transcribe_audio(audio_file):
+def transcribe_audio(audio_bytes, mime_type):
 
-    # Streamlit's UploadedFile-like object may already have a name,
-    # but giving OpenAI an explicit filename helps it identify the format.
-    audio_bytes = audio_file.getvalue()
+    if not audio_bytes:
+
+        raise ValueError(
+            "The recording was empty."
+        )
+
+    # Browsers record in different formats (Chrome/Edge: webm,
+    # Firefox: ogg, Safari: mp4). Give OpenAI a matching filename.
+    mime_type = (mime_type or "").lower()
+
+    if "mp4" in mime_type:
+        extension = "mp4"
+    elif "ogg" in mime_type:
+        extension = "ogg"
+    elif "wav" in mime_type:
+        extension = "wav"
+    else:
+        extension = "webm"
 
     transcription_file = BytesIO(audio_bytes)
-    transcription_file.name = "candidate_answer.wav"
+    transcription_file.name = f"candidate_answer.{extension}"
 
     transcription = client.audio.transcriptions.create(
         model=TRANSCRIPTION_MODEL,
@@ -382,6 +506,94 @@ def transcribe_audio(audio_file):
         )
 
     return transcript
+
+
+# =========================================================
+# SCORING HELPERS
+# =========================================================
+
+def clamp_score(value):
+
+    try:
+        score = int(round(float(value)))
+    except (TypeError, ValueError):
+        score = 0
+
+    return max(0, min(100, score))
+
+
+def recommendation_for_score(score):
+
+    for threshold, label in RECOMMENDATION_THRESHOLDS:
+
+        if score >= threshold:
+            return label
+
+    return RECOMMENDATION_THRESHOLDS[-1][1]
+
+
+def apply_weighted_scoring(result):
+    """
+    Attach importance and weight to each skill assessment, then
+    compute the overall score (0-100) as an importance-weighted
+    average of the skill scores. The overall score and the
+    recommendation are calculated here, not by the model, so the
+    maths is consistent and reproducible.
+    """
+
+    skills = st.session_state.skills
+
+    assessments = result.get("skill_assessments", [])
+
+    by_name = {
+        str(item.get("skill", "")).strip().lower(): item
+        for item in assessments
+    }
+
+    total_importance = sum(
+        skill["importance"] for skill in skills
+    )
+
+    ordered_assessments = []
+    weighted_total = 0
+    weight_used = 0
+
+    for index, skill in enumerate(skills):
+
+        item = by_name.get(skill["name"].lower())
+
+        # Fall back to position if the model altered a skill name.
+        if item is None and len(assessments) == len(skills):
+            item = assessments[index]
+
+        if item is None:
+            continue
+
+        item["skill"] = skill["name"]
+        item["score"] = clamp_score(item.get("score"))
+        item["importance"] = skill["importance"]
+        item["weight_percent"] = round(
+            skill["importance"] / total_importance * 100
+        )
+
+        weighted_total += item["score"] * skill["importance"]
+        weight_used += skill["importance"]
+
+        ordered_assessments.append(item)
+
+    overall_score = (
+        round(weighted_total / weight_used)
+        if weight_used
+        else 0
+    )
+
+    result["skill_assessments"] = ordered_assessments
+    result["overall_score"] = overall_score
+    result["recommendation"] = recommendation_for_score(
+        overall_score
+    )
+
+    return result
 
 
 # =========================================================
@@ -407,7 +619,13 @@ def generate_interview_result():
     )
 
     skills_json = json.dumps(
-        st.session_state.skills,
+        [
+            {
+                "skill": skill["name"],
+                "importance_out_of_10": skill["importance"]
+            }
+            for skill in st.session_state.skills
+        ],
         indent=2
     )
 
@@ -429,7 +647,7 @@ JOB DESCRIPTION:
 {st.session_state.job_description}
 
 
-SKILLS ASSESSED:
+SKILLS ASSESSED (with the importance the employer gave each skill):
 
 {skills_json}
 
@@ -461,42 +679,37 @@ ask about a particular subject.
 
 If there is insufficient evidence for a skill, state that clearly.
 
+Score each skill independently on its own merits. The importance
+values are applied to the overall score separately, so do NOT
+adjust a skill's score because of its importance and do NOT
+calculate an overall score. Use the full range of the scale.
+
 For each skill:
 
 1. Assess the candidate's demonstrated knowledge.
 2. Identify specific strengths.
 3. Identify weaknesses, concerns or gaps.
 4. Cite concise evidence from the candidate's actual answers.
-5. Give the skill an integer score from 1 to 5.
+5. Give the skill an integer score from 0 to 100.
 
 Then provide:
 
-- an overall integer score from 1 to 5
-- an overall assessment
+- an overall assessment (a short narrative that gives more
+  attention to the skills with higher importance)
 - key strengths
 - key concerns
-- a final recommendation
 
-The recommendation MUST be exactly one of:
+SCORING GUIDE (per skill, 0-100):
 
-"Strongly Recommended"
-"Recommended"
-"Proceed with Caution"
-"Not Recommended"
-
-SCORING GUIDE:
-
-1 = Little or no relevant competence demonstrated
-2 = Limited competence with substantial gaps
-3 = Acceptable competence with some gaps
-4 = Strong competence demonstrated
-5 = Exceptional and detailed competence demonstrated
+0-20   = Little or no relevant competence demonstrated
+21-40  = Limited competence with substantial gaps
+41-60  = Acceptable competence with some gaps
+61-80  = Strong competence demonstrated
+81-100 = Exceptional and detailed competence demonstrated
 
 Return ONLY valid JSON using this exact structure:
 
 {{
-    "overall_score": 0,
-    "recommendation": "",
     "overall_assessment": "",
     "key_strengths": [],
     "key_concerns": [],
@@ -522,7 +735,7 @@ Return ONLY valid JSON using this exact structure:
         response.output_text
     )
 
-    return result
+    return apply_weighted_scoring(result)
 
 
 # =========================================================
@@ -544,7 +757,7 @@ def create_transcript_text():
         "",
         f"Candidate: {candidate_name}",
         f"Job title: {st.session_state.job_title}",
-        f"Skills: {', '.join(st.session_state.skills)}",
+        f"Skills: {', '.join(skill_names())}",
         "",
         "=" * 60,
         ""
@@ -588,6 +801,20 @@ def reset_interview():
 
 
 # =========================================================
+# MOVE TO THE NEXT SKILL
+# =========================================================
+
+def advance_to_next_skill():
+
+    st.session_state.current_skill_index += 1
+    st.session_state.messages = []
+    st.session_state.current_question = None
+    st.session_state.current_question_audio = None
+    st.session_state.recording_attempt = 0
+    st.session_state.answer_processing = False
+
+
+# =========================================================
 # SETUP SCREEN
 # =========================================================
 
@@ -625,7 +852,15 @@ def show_setup_screen():
 
     st.subheader("Interview Skills")
 
+    st.caption(
+        f"Each skill gets up to {MAX_QUESTIONS_PER_SKILL} questions. "
+        "Importance decides how much each skill counts towards the "
+        "overall score."
+    )
+
     if st.session_state.skills:
+
+        shares = importance_shares()
 
         for index, skill in enumerate(
             st.session_state.skills
@@ -638,7 +873,10 @@ def show_setup_screen():
             with skill_column:
 
                 st.markdown(
-                    f"**{skill}**"
+                    f"**{skill['name']}** &nbsp;·&nbsp; "
+                    f"importance {skill['importance']}/10 "
+                    f"({IMPORTANCE_LABELS[skill['importance']]}) "
+                    f"&nbsp;·&nbsp; {shares[index]}% of overall score"
                 )
 
             with delete_column:
@@ -646,7 +884,7 @@ def show_setup_screen():
                 if st.button(
                     "✕",
                     key=f"delete_skill_{index}",
-                    help=f"Remove {skill}"
+                    help=f"Remove {skill['name']}"
                 ):
 
                     st.session_state.skills.pop(
@@ -691,6 +929,19 @@ def show_setup_screen():
                 placeholder="e.g. Python"
             )
 
+            new_importance = st.select_slider(
+                "Importance of this skill for the role",
+                options=list(range(1, 11)),
+                value=DEFAULT_IMPORTANCE,
+                format_func=format_importance
+            )
+
+            st.caption(
+                "**Calibration:** 1-2 Nice to have · 3-4 Useful · "
+                "5-6 Important · 7-8 Very important · "
+                "9-10 Critical / essential to the role"
+            )
+
             add_skill_submitted = st.form_submit_button(
                 "Add Skill",
                 type="primary",
@@ -710,8 +961,8 @@ def show_setup_screen():
                 else:
 
                     existing_skills = [
-                        skill.lower()
-                        for skill in st.session_state.skills
+                        name.lower()
+                        for name in skill_names()
                     ]
 
                     if (
@@ -726,7 +977,10 @@ def show_setup_screen():
                     else:
 
                         st.session_state.skills.append(
-                            cleaned_skill
+                            {
+                                "name": cleaned_skill,
+                                "importance": new_importance
+                            }
                         )
 
                         st.session_state.show_skill_input = False
@@ -804,7 +1058,7 @@ def show_setup_screen():
                 st.session_state.cv_profile = (
                     extract_cv_profile(
                         st.session_state.cv_text,
-                        st.session_state.skills
+                        skill_names()
                     )
                 )
 
@@ -830,6 +1084,7 @@ def show_setup_screen():
         st.session_state.messages = []
         st.session_state.transcript = []
         st.session_state.question_number = 1
+        st.session_state.recording_attempt = 0
         st.session_state.current_question = None
         st.session_state.current_question_audio = None
         st.session_state.interview_result = None
@@ -854,7 +1109,7 @@ def show_interview_screen():
 
     current_skill = st.session_state.skills[
         st.session_state.current_skill_index
-    ]
+    ]["name"]
 
     candidate_name = (
         st.session_state.cv_profile or {}
@@ -881,10 +1136,18 @@ def show_interview_screen():
 
     st.subheader(current_skill)
 
+    current_skill_answers = [
+        item
+        for item in st.session_state.transcript
+        if item["skill"] == current_skill
+    ]
+
     st.caption(
         f"Interview skill "
         f"{st.session_state.current_skill_index + 1} "
-        f"of {len(st.session_state.skills)}"
+        f"of {len(st.session_state.skills)} | "
+        f"Question {len(current_skill_answers) + 1} "
+        f"of {MAX_QUESTIONS_PER_SKILL}"
     )
 
     # Generate the current question only once.
@@ -931,98 +1194,104 @@ def show_interview_screen():
 
     st.info(question)
 
-    if st.session_state.current_question_audio:
-
-        st.audio(
-            st.session_state.current_question_audio,
-            format="audio/mpeg",
-            autoplay=True
-        )
-
     st.divider()
 
     st.markdown("### Candidate")
 
-    audio = st.audio_input(
-        "Record your answer",
-        sample_rate=None,
-        key=f"answer_{st.session_state.question_number}"
+    st.caption(
+        f"The question plays automatically. After it finishes you "
+        f"have {PREP_COUNTDOWN_SECONDS} seconds to think, then "
+        f"recording starts by itself (up to "
+        f"{MAX_ANSWER_SECONDS // 60} minutes). Press Done when "
+        f"you have finished answering."
     )
 
-    if audio is not None:
+    audio_b64 = ""
 
-        st.caption(
-            "Your recording is ready. Select Submit Answer "
-            "when you are satisfied with it."
-        )
+    if st.session_state.current_question_audio:
 
-        if st.button(
-            "Submit Answer",
-            type="primary",
-            use_container_width=True,
-            disabled=st.session_state.answer_processing
+        audio_b64 = base64.b64encode(
+            st.session_state.current_question_audio
+        ).decode("utf-8")
+
+    recording = interview_recorder(
+        question_audio=audio_b64,
+        countdown_seconds=PREP_COUNTDOWN_SECONDS,
+        max_record_seconds=MAX_ANSWER_SECONDS,
+        key=(
+            f"recorder_{st.session_state.question_number}_"
+            f"{st.session_state.recording_attempt}"
+        ),
+        default=None
+    )
+
+    if recording and recording.get("audio"):
+
+        with st.spinner(
+            "Transcribing your answer..."
         ):
 
-            st.session_state.answer_processing = True
+            try:
 
-            with st.spinner(
-                "Transcribing your answer..."
-            ):
+                answer = transcribe_audio(
+                    base64.b64decode(recording["audio"]),
+                    recording.get("mime", "")
+                )
 
-                try:
+            except Exception as error:
 
-                    answer = transcribe_audio(
-                        audio
-                    )
+                st.error(
+                    f"Transcription failed: {error}"
+                )
 
-                except Exception as error:
+                if st.button(
+                    "Record this answer again",
+                    use_container_width=True
+                ):
 
-                    st.session_state.answer_processing = False
+                    st.session_state.recording_attempt += 1
+                    st.rerun()
 
-                    st.error(
-                        f"Transcription failed: {error}"
-                    )
+                return
 
-                    return
+        st.session_state.transcript.append(
+            {
+                "skill": current_skill,
+                "question_number":
+                    st.session_state.question_number,
+                "question": question,
+                "answer": answer
+            }
+        )
 
-            st.session_state.transcript.append(
-                {
-                    "skill": current_skill,
-                    "question_number":
-                        st.session_state.question_number,
-                    "question": question,
-                    "answer": answer
-                }
-            )
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": question
+            }
+        )
 
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": question
-                }
-            )
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": answer
+            }
+        )
 
-            st.session_state.messages.append(
-                {
-                    "role": "user",
-                    "content": answer
-                }
-            )
+        st.session_state.question_number += 1
+        st.session_state.recording_attempt = 0
+        st.session_state.current_question = None
+        st.session_state.current_question_audio = None
+        st.session_state.answer_processing = False
 
-            st.session_state.question_number += 1
-            st.session_state.current_question = None
-            st.session_state.current_question_audio = None
-            st.session_state.answer_processing = False
+        # Maximum questions reached: move on automatically.
+        if len(current_skill_answers) + 1 >= MAX_QUESTIONS_PER_SKILL:
 
-            st.rerun()
+            advance_to_next_skill()
+
+        st.rerun()
 
     # Show previous answers for the current skill.
-    current_skill_answers = [
-        item
-        for item in st.session_state.transcript
-        if item["skill"] == current_skill
-    ]
-
     if current_skill_answers:
 
         with st.expander(
@@ -1059,17 +1328,17 @@ def show_interview_screen():
     if is_last_skill:
 
         finish_button_text = (
-            "Finish Interview and Generate Result"
+            "Skip remaining questions and Generate Result"
         )
 
     else:
 
         next_skill = st.session_state.skills[
             st.session_state.current_skill_index + 1
-        ]
+        ]["name"]
 
         finish_button_text = (
-            f"Finish {current_skill} and Move to {next_skill}"
+            f"Skip remaining questions and Move to {next_skill}"
         )
 
     if st.button(
@@ -1086,11 +1355,7 @@ def show_interview_screen():
 
             return
 
-        st.session_state.current_skill_index += 1
-        st.session_state.messages = []
-        st.session_state.current_question = None
-        st.session_state.current_question_audio = None
-        st.session_state.answer_processing = False
+        advance_to_next_skill()
 
         st.rerun()
 
@@ -1186,8 +1451,12 @@ def show_finished_screen():
     st.subheader(recommendation)
 
     st.metric(
-        "Overall Score",
-        f"{overall_score} / 5"
+        "Overall Score (importance-weighted)",
+        f"{overall_score}%"
+    )
+
+    st.progress(
+        max(0, min(100, overall_score)) / 100
     )
 
     st.markdown("### Overall Assessment")
@@ -1249,7 +1518,7 @@ def show_finished_screen():
 
     st.divider()
 
-    st.header("Skill Assessments")
+    st.header("Score Breakdown")
 
     skill_assessments = result.get(
         "skill_assessments",
@@ -1261,6 +1530,22 @@ def show_finished_screen():
         st.warning(
             "The assessment did not contain individual skill results."
         )
+
+    else:
+
+        st.table(
+            [
+                {
+                    "Skill": item["skill"],
+                    "Importance": f"{item['importance']}/10",
+                    "Weight": f"{item['weight_percent']}%",
+                    "Score": f"{item['score']}%"
+                }
+                for item in skill_assessments
+            ]
+        )
+
+    st.header("Skill Assessments")
 
     for skill_result in skill_assessments:
 
@@ -1279,7 +1564,17 @@ def show_finished_screen():
         ):
 
             st.subheader(
-                f"{skill_name}: {skill_score}/5"
+                f"{skill_name}: {skill_score}%"
+            )
+
+            st.progress(
+                max(0, min(100, skill_score)) / 100
+            )
+
+            st.caption(
+                f"Importance {skill_result.get('importance', '-')}/10 "
+                f"· {skill_result.get('weight_percent', '-')}% "
+                f"of the overall score"
             )
 
             st.write(
