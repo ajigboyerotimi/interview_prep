@@ -972,7 +972,7 @@ def show_setup_screen():
     st.title("🎙️ AI Interviewer")
 
     st.write(
-        "Configure the interview, upload the candidate's CV "
+        "Configure the interview, upload your CV "
         "and add the skills you want to assess."
     )
 
