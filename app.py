@@ -1001,14 +1001,6 @@ def show_setup_screen():
 
     st.subheader("Interview Skills")
 
-    st.caption(
-        "Importance decides how many questions a skill gets "
-        "(" + ", ".join(
-            f"{level}: {count}"
-            for level, count in QUESTIONS_BY_IMPORTANCE.items()
-        ) + ") and how much it counts towards the overall score."
-    )
-
     if st.session_state.skills:
 
         shares = importance_shares()
@@ -1105,7 +1097,6 @@ def show_setup_screen():
         )
 
         st.caption(
-            f"**{new_importance} - {IMPORTANCE_LABELS[new_importance]}:** "
             f"{IMPORTANCE_MEANINGS[new_importance]}"
         )
 
