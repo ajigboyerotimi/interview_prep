@@ -1270,10 +1270,7 @@ def show_interview_screen():
 
     st.caption(
         f"Interview skill "
-        f"{st.session_state.current_skill_index + 1} "
-        f"of {len(st.session_state.skills)} | "
-        f"Question {len(current_skill_answers) + 1} "
-        f"of {max_questions_for(current_skill)}"
+        f"Question {len(current_skill_answers) + 1}"
     )
 
     # Generate the current question only once.
