@@ -1072,8 +1072,8 @@ def show_setup_screen():
 
         new_importance = st.slider(
             "Importance of this skill for the role",
-            # min_value=IMPORTANCE_MIN,
-            # max_value=IMPORTANCE_MAX,
+            min_value=IMPORTANCE_MIN,
+            max_value=IMPORTANCE_MAX,
             value=DEFAULT_IMPORTANCE,
             step=1,
             key="new_skill_importance"
