@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; }
+  body { font-family: "Source Sans Pro", -apple-system, "Segoe UI", sans-serif; color: #31333F; }
+  #card { border: 1px solid rgba(128,128,128,.35); border-radius: 12px; padding: 16px; text-align: center; }
+  #status { font-size: 15px; margin-bottom: 4px; opacity: .85; }
+  #time { font-size: 40px; font-weight: 600; font-variant-numeric: tabular-nums; margin: 4px 0 10px; min-height: 48px; }
+  #track { height: 8px; border-radius: 4px; background: rgba(128,128,128,.25); overflow: hidden; margin-bottom: 14px; }
+  #fill { height: 100%; width: 0%; background: #ff4b4b; transition: width .25s linear; }
+  #fill.countdown { background: #f0a500; }
+  button { font-family: inherit; font-size: 15px; font-weight: 600; color: #fff; background: #ff4b4b;
+           border: 0; border-radius: 8px; padding: 10px 20px; cursor: pointer; width: 100%; }
+  button:hover { filter: brightness(1.08); }
+  .hidden { display: none; }
+  #msg { font-size: 13px; margin-top: 10px; color: #d33; }
+  .pulse { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #ff4b4b;
+           margin-right: 6px; animation: pulse 1s infinite; }
+  @keyframes pulse { 0% { opacity: 1; } 50% { opacity: .25; } 100% { opacity: 1; } }
+</style>
+</head>
+<body>
+<div id="card">
+  <div id="status"></div>
+  <div id="time"></div>
+  <div id="track"><div id="fill"></div></div>
+  <button id="action" class="hidden"></button>
+  <div id="msg"></div>
+</div>
+
+<script>
+  // ---- Minimal Streamlit component protocol (no build step needed) ----
+  const Streamlit = {
+    send(type, data) {
+      window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
+    },
+    ready()   { this.send("streamlit:componentReady", { apiVersion: 1 }); },
+    height(h) { this.send("streamlit:setFrameHeight", { height: h }); },
+    value(v)  { this.send("streamlit:setComponentValue", { value: v, dataType: "json" }); }
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $("status"), timeEl = $("time"), fillEl = $("fill"), actionEl = $("action"), msgEl = $("msg");
+
+  function fmt(sec) {
+    sec = Math.max(0, Math.ceil(sec));
+    return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
+  }
+  function resize() { Streamlit.height(document.documentElement.scrollHeight + 4); }
+
+  function applyTheme(theme) {
+    if (!theme) return;
+    if (theme.textColor) document.body.style.color = theme.textColor;
+    if (theme.primaryColor) {
+      actionEl.style.background = theme.primaryColor;
+      fillEl.style.background = theme.primaryColor;
+    }
+  }
+
+  let started = false;
+
+  window.addEventListener("message", (event) => {
+    if (!event.data || event.data.type !== "streamlit:render") return;
+    applyTheme(event.data.theme);
+    // Streamlit re-sends render events on every rerun; only start once.
+    if (started) return;
+    started = true;
+    run(event.data.args || {});
+  });
+
+  Streamlit.ready();
+  resize();
+
+  function run(args) {
+    const COUNTDOWN = args.countdown_seconds || 30;
+    const MAX_RECORD = args.max_record_seconds || 180;
+
+    let stream = null, micPromise = null, recorder = null, chosenMime = "";
+    let chunks = [], ticker = null, recStart = 0, actionHandler = null;
+
+    function setAction(label, handler) {
+      if (!label) { actionEl.classList.add("hidden"); actionHandler = null; return; }
+      actionEl.textContent = label;
+      actionEl.classList.remove("hidden");
+      actionHandler = handler;
+    }
+    actionEl.addEventListener("click", () => { if (actionHandler) actionHandler(); });
+
+    function show(status, time, pct, isCountdown) {
+      statusEl.innerHTML = status;
+      timeEl.textContent = time;
+      fillEl.style.width = pct + "%";
+      fillEl.classList.toggle("countdown", !!isCountdown);
+      resize();
+    }
+
+    // ---- Microphone ----
+    function getMic() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        return Promise.reject(new Error("Microphone access is not available in this browser or context."));
+      }
+      return navigator.mediaDevices.getUserMedia({ audio: true }).then((s) => { stream = s; return s; });
+    }
+    function micError(err) {
+      clearInterval(ticker);
+      show("Microphone problem", "⚠️", 0, false);
+      msgEl.textContent = (err && err.message ? err.message : "Could not access the microphone.") +
+                          " Allow microphone access in your browser, then press Retry.";
+      setAction("Retry microphone", () => {
+        msgEl.textContent = "";
+        micPromise = getMic();
+        micPromise.then(startCountdown).catch(micError);
+      });
+    }
+
+    // ---- Phase 1: interviewer audio ----
+    function playQuestion() {
+      if (!args.question_audio) { startCountdown(); return; }
+      const audio = new Audio("data:audio/mpeg;base64," + args.question_audio);
+      audio.onended = startCountdown;
+      audio.onerror = startCountdown;
+      show("🔊 The interviewer is asking the question…", "", 0, false);
+      setAction(null);
+      const p = audio.play();
+      if (p && p.catch) {
+        p.catch(() => {
+          // Browser blocked autoplay: let the user start it manually.
+          show("Your browser blocked automatic playback.", "🔇", 0, false);
+          setAction("▶ Play question", () => {
+            show("🔊 The interviewer is asking the question…", "", 0, false);
+            setAction(null);
+            audio.play().catch(startCountdown);
+          });
+        });
+      }
+    }
+
+    // ---- Phase 2: preparation countdown ----
+    function startCountdown() {
+      clearInterval(ticker);
+      const begin = Date.now();
+      const tick = () => {
+        const remaining = COUNTDOWN - (Date.now() - begin) / 1000;
+        if (remaining <= 0) { clearInterval(ticker); startRecording(); return; }
+        show("Get ready — recording starts automatically in", fmt(remaining),
+             ((COUNTDOWN - remaining) / COUNTDOWN) * 100, true);
+      };
+      tick();
+      ticker = setInterval(tick, 250);
+      setAction("Start recording now", () => { clearInterval(ticker); startRecording(); });
+    }
+
+    // ---- Phase 3: recording ----
+    function startRecording() {
+      setAction(null);
+      (micPromise || getMic()).then(() => {
+        const types = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+        chosenMime = types.find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
+        recorder = chosenMime ? new MediaRecorder(stream, { mimeType: chosenMime }) : new MediaRecorder(stream);
+        chunks = [];
+        recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+        recorder.onstop = finish;
+        recorder.start(1000);
+        recStart = Date.now();
+
+        const tick = () => {
+          const elapsed = (Date.now() - recStart) / 1000;
+          show('<span class="pulse"></span>Recording your answer',
+               fmt(elapsed) + " / " + fmt(MAX_RECORD), (elapsed / MAX_RECORD) * 100, false);
+          if (elapsed >= MAX_RECORD) stopRecording();
+        };
+        tick();
+        ticker = setInterval(tick, 250);
+        setAction("⏹ Done — submit my answer", stopRecording);
+      }).catch(micError);
+    }
+
+    function stopRecording() {
+      clearInterval(ticker);
+      setAction(null);
+      if (recorder && recorder.state !== "inactive") recorder.stop();
+    }
+
+    function finish() {
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      const type = (recorder && recorder.mimeType) || chosenMime || "audio/webm";
+      const blob = new Blob(chunks, { type: type });
+      const duration = (Date.now() - recStart) / 1000;
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const b64 = String(reader.result).split(",")[1] || "";
+        show("✅ Answer captured — processing…", "", 100, false);
+        Streamlit.value({ audio: b64, mime: type, duration: duration });
+      };
+      reader.readAsDataURL(blob);
+    }
+
+    window.addEventListener("pagehide", () => {
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+    });
+
+    // Ask for the microphone straight away so the permission prompt
+    // appears while the question is playing, not when recording begins.
+    micPromise = getMic();
+    micPromise.catch(() => {});   // errors are handled when recording starts
+    playQuestion();
+  }
+</script>
+</body>
+</html>
