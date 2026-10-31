@@ -1337,18 +1337,27 @@ def show_interview_screen():
             st.session_state.current_question_audio
         ).decode("utf-8")
 
+    # Identifies this exact question + attempt. The recorder echoes it
+    # back, so an old recording is never mistaken for a new answer.
+    recorder_nonce = (
+        f"{st.session_state.question_number}_"
+        f"{st.session_state.recording_attempt}"
+    )
+
     recording = interview_recorder(
         question_audio=audio_b64,
         countdown_seconds=PREP_COUNTDOWN_SECONDS,
         max_record_seconds=MAX_ANSWER_SECONDS,
-        key=(
-            f"recorder_{st.session_state.question_number}_"
-            f"{st.session_state.recording_attempt}"
-        ),
+        nonce=recorder_nonce,
+        key="interview_recorder",
         default=None
     )
 
-    if recording and recording.get("audio"):
+    if (
+        recording
+        and recording.get("audio")
+        and recording.get("nonce") == recorder_nonce
+    ):
 
         with st.spinner(
             "Transcribing your answer..."
