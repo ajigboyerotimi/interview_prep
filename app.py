@@ -19,7 +19,7 @@ TTS_MODEL = "gpt-4o-mini-tts-2025-12-15"
 TTS_VOICE = "marin"
 
 # Interview flow
-# Questions asked per skill, decided by the skill's importance (1-5)
+ Questions asked per skill, decided by the skill's importance (1-5)
 QUESTIONS_BY_IMPORTANCE = {
     1: 2,
     2: 3,
@@ -1083,8 +1083,8 @@ def show_setup_screen():
 
         markers = "".join(
             '<span class="imp-marker'
-            #+ (" first" if value == IMPORTANCE_MIN else "")
-            #+ (" last" if value == IMPORTANCE_MAX else "")
+            + (" first" if value == IMPORTANCE_MIN else "")
+            + (" last" if value == IMPORTANCE_MAX else "")
             + (" active" if value == new_importance else "")
             + f'" style="left:{(value - IMPORTANCE_MIN) / span * 100}%">'
             + f"{value}<br>{IMPORTANCE_LABELS[value]}</span>"
