@@ -999,7 +999,7 @@ def show_setup_screen():
 
     st.divider()
 
-    st.subheader("Interview Skills")
+    st.subheader("Skills")
 
     if st.session_state.skills:
 
@@ -1055,7 +1055,7 @@ def show_setup_screen():
         if st.button(
             "➕",
             use_container_width=True,
-            help="Add another interview skill"
+            help="Add another skill"
         ):
 
             st.session_state.show_skill_input = True
@@ -1148,7 +1148,7 @@ def show_setup_screen():
         if not st.session_state.skills:
 
             st.error(
-                "Please add at least one interview skill."
+                "Please add at least one skill."
             )
 
             return
@@ -1269,7 +1269,6 @@ def show_interview_screen():
     ]
 
     st.caption(
-        f"Interview skill "
         f"Question {len(current_skill_answers) + 1}"
     )
 
