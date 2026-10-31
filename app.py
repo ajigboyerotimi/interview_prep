@@ -19,7 +19,7 @@ TTS_MODEL = "gpt-4o-mini-tts-2025-12-15"
 TTS_VOICE = "marin"
 
 # Interview flow
- Questions asked per skill, decided by the skill's importance (1-5)
+# Questions asked per skill, decided by the skill's importance (1-5)
 QUESTIONS_BY_IMPORTANCE = {
     1: 2,
     2: 3,
